@@ -15,7 +15,8 @@ spec.loader.exec_module(c)
 class ControlTests(unittest.TestCase):
     def state(self):
         return dict(ssh_ports=[22222], allow=["198.51.100.9", "2001:db8::1"],
-                    lists={"test": ["198.51.100.0/24", "2001:db8::/32"]}, manual=[])
+                    lists={"test": ["198.51.100.0/24", "2001:db8::/32"]}, manual=[],
+                    updated=1700000000, logging=True)
 
     def test_canonical(self):
         self.assertEqual(c.networks("1.2.3.4/24 # test\n"), ["1.2.3.0/24"])
@@ -111,6 +112,36 @@ class ControlTests(unittest.TestCase):
         with patch.object(c, 'run', return_value=result), patch('sys.stdout', output):
             c.top(resolve=False)
         self.assertIn('заблокированных обращений пока нет', output.getvalue())
+        self.assertNotIn('Владелец сети', output.getvalue())
+
+    def test_top_table_fits_terminal_width(self):
+        messages = [json.dumps({"MESSAGE": "CBTC6 SRC=2001:db8:1234:5678::1234 "})]
+        result = c.subprocess.CompletedProcess(('journalctl',), 0, '\n'.join(messages), '')
+        for width in (20, 32, 60, 80, 100, 120):
+            with self.subTest(width=width):
+                output = io.StringIO()
+                expected = min(width, 100)
+                with patch.object(c, 'run', return_value=result), \
+                     patch.object(c, 'lookup_many', return_value={"2001:db8:1234:5678::1234": "X" * 200}), \
+                     patch.object(c.shutil, 'get_terminal_size', return_value=c.os.terminal_size((width, 24))), \
+                     patch('sys.stdout', output):
+                    c.top(resolve=True)
+                lines = output.getvalue().splitlines()
+                self.assertTrue(all(len(line) <= expected for line in lines))
+                self.assertEqual(len(lines[1]), expected)
+                if width >= 60:
+                    self.assertIn('Организация / сеть', output.getvalue())
+
+    def test_ascii_symbols_for_non_utf8_stdout(self):
+        class AsciiOutput(io.StringIO):
+            encoding = 'ascii'
+
+        output = AsciiOutput()
+        with patch('sys.stdout', output):
+            c.ok('готово')
+            c.rule()
+        self.assertIn('[OK] готово', output.getvalue())
+        self.assertIn('=' * c.terminal_width(), output.getvalue())
 
     def test_log_report_accepts_empty_journals(self):
         output = io.StringIO()
@@ -189,7 +220,7 @@ class ControlTests(unittest.TestCase):
             c.menu()
         text = output.getvalue()
         self.assertIn('Тестовая версия', text)
-        self.assertIn('[ 1]  Установить компонент', text)
+        self.assertIn('[1]  Установить компонент', text)
         self.assertNotIn('[10]  Удалить компонент', text)
         self.assertNotIn('\033[', text)
 
@@ -203,9 +234,11 @@ class ControlTests(unittest.TestCase):
             state.exists.return_value = True
             c.menu()
         text = output.getvalue()
-        self.assertIn('[ 1]  Показать краткое состояние', text)
-        self.assertIn('[10]  Удалить компонент', text)
-        self.assertIn('[11]  Самодиагностика', text)
+        self.assertIn('[1]  Показать краткое состояние', text)
+        self.assertIn('[10] Удаление программы', text)
+        self.assertIn('[11] Самодиагностика', text)
+        self.assertIn('СОСТОЯНИЕ И СПИСКИ', text)
+        self.assertIn('БЛОКИРОВКИ И ИСКЛЮЧЕНИЯ', text)
         self.assertLess(text.index('ГЛАВНОЕ МЕНЮ'), text.index('ТОП-10 ПРОВЕРКА'))
 
     def test_short_command_aliases(self):
@@ -274,12 +307,29 @@ class ControlTests(unittest.TestCase):
 
     def test_compact_status_does_not_dump_rules(self):
         output = io.StringIO()
-        with patch.object(c, 'component_report'), patch('sys.stdout', output):
+        with patch.object(c, 'present', return_value=True), patch.object(c, 'ROOT') as root, \
+             patch('sys.stdout', output):
+            root.__truediv__.return_value.exists.return_value = False
             c.print_status(self.state())
         text = output.getvalue()
-        self.assertIn('НАСТРОЙКИ', text)
-        self.assertIn('Полные правила: ctc r', text)
+        self.assertIn('СОСТОЯНИЕ', text)
+        self.assertIn('Таблица nftables', text)
+        self.assertIn('Списки обновлены', text)
+        self.assertIn('14.11.2023', text)
+        self.assertIn('Полные правила: cheburnet-traffic-control rules', text)
         self.assertNotIn('table inet', text)
+
+    def test_help_is_russian_and_documents_all_commands(self):
+        output = io.StringIO()
+        with patch('sys.stdout', output), self.assertRaises(SystemExit):
+            c.main(['--help'])
+        text = output.getvalue()
+        self.assertIn('использование:', text)
+        self.assertIn('параметры:', text)
+        for command in ('install', 'top', 'status', 'rules', 'logs', 'check', 'activate',
+                        'confirm', 'disable', 'restore', 'rollback', 'update', 'repair',
+                        'ban', 'unban', 'allow', 'disallow', 'uninstall'):
+            self.assertIn(command, text)
 
     def test_systemd_descriptions_are_russian(self):
         self.assertTrue(all('Description=ЧебурNET' in body for body in c.service_files().values()))

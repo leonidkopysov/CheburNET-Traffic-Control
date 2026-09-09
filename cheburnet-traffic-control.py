@@ -5,6 +5,7 @@
 Copyright (c) 2026 Леонид Копысов. SPDX-License-Identifier: MIT
 """
 import argparse
+import codecs
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -19,10 +20,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import urllib.request
 
-VERSION = "0.1.0-alpha.6"
+VERSION = "0.1.0-alpha.7"
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")
 STATE = ROOT / "state.json"
@@ -35,6 +37,7 @@ SOURCES = {name: BASE + name + ".list" for name in
            ("antiscanner", "government_networks", "skipa")}
 MAX_BYTES = 8 * 1024 * 1024
 MAX_ENTRIES = 150000
+LABEL_LIMIT = 100
 CA_CERT = Path("/etc/ssl/certs/ca-certificates.crt")
 OS_RELEASE = Path("/etc/os-release")
 
@@ -59,16 +62,100 @@ def colored(text, *styles):
     return "".join(ANSI[x] for x in styles) + str(text) + ANSI["reset"]
 
 
-def rule(char="━", width=62, style="cyan"):
-    print(colored(char * width, style))
+def utf8_output():
+    """Return whether terminal symbols are safe for the current stdout."""
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return False
+    try:
+        return codecs.lookup(encoding).name == "utf-8"
+    except LookupError:
+        return False
+
+
+def symbol(name):
+    unicode_symbols = {
+        "heavy": "━", "light": "─", "ok": "✓", "warn": "⚠",
+        "error": "✗", "info": "·", "idle": "○", "pending": "◷",
+    }
+    ascii_symbols = {
+        "heavy": "=", "light": "-", "ok": "[OK]", "warn": "[!]",
+        "error": "[X]", "info": "[ ]", "idle": "[ ]", "pending": "[~]",
+    }
+    return (unicode_symbols if utf8_output() else ascii_symbols)[name]
+
+
+def terminal_width():
+    """Fit the interface to the current terminal without exceeding 100 columns."""
+    return max(20, min(shutil.get_terminal_size((80, 24)).columns, 100))
+
+
+def rule(char=None, width=None, style="cyan"):
+    if char in (None, "━", "="):
+        char = symbol("heavy")
+    elif char in ("─", "-"):
+        char = symbol("light")
+    print(colored(char * (terminal_width() if width is None else width), style))
+
+
+def message(kind, text, *styles, file=None):
+    marks = {"ok": "ok", "warn": "warn", "error": "error", "info": "info", "pending": "pending"}
+    colors = {"ok": "green", "warn": "yellow", "error": "red", "info": "dim", "pending": "yellow"}
+    prefix = f"  {symbol(marks[kind])} "
+    available = max(1, terminal_width() - len(prefix))
+    lines = textwrap.wrap(str(text), width=available, replace_whitespace=False,
+                          drop_whitespace=True) or [""]
+    for index, line in enumerate(lines):
+        rendered = (prefix if index == 0 else " " * len(prefix)) + line
+        print(colored(rendered, colors[kind], *styles), file=file)
+
+
+def ok(text):
+    message("ok", text, "bold")
+
+
+def warn(text):
+    message("warn", text, "bold")
+
+
+def err(text, file=None):
+    message("error", text, "bold", file=file)
+
+
+def info(text):
+    message("info", text)
+
+
+def pending(text):
+    message("pending", text, "bold")
+
+
+def print_fit(text, *styles, indent=2):
+    available = max(1, terminal_width() - indent)
+    lines = textwrap.wrap(str(text), width=available, replace_whitespace=False,
+                          drop_whitespace=True) or [""]
+    for line in lines:
+        print(" " * indent + colored(line, *styles))
 
 
 def menu_line(key, label, style="white"):
-    print("  " + colored(f"[{key:>2}]", "bold", style) + "  " + colored(label, style))
+    token = f"[{key}]".ljust(5)
+    prefix = "  " + token
+    available = max(1, terminal_width() - len(prefix))
+    lines = textwrap.wrap(label, width=available) or [""]
+    print("  " + colored(token, "bold", style) + colored(lines[0], style))
+    for line in lines[1:]:
+        print(" " * len(prefix) + colored(line, style))
+
+
+def menu_section(label):
+    print()
+    print(colored("  " + label.upper(), "magenta", "bold"))
 
 
 def status_mark(ok, good="РАБОТАЕТ", bad="НЕ РАБОТАЕТ"):
-    return colored("✓ " + good, "green", "bold") if ok else colored("✗ " + bad, "red", "bold")
+    return (colored(symbol("ok") + " " + good, "green", "bold") if ok else
+            colored(symbol("error") + " " + bad, "red", "bold"))
 
 
 def menu_status():
@@ -118,9 +205,9 @@ def apt_install(packages):
         raise ValueError("Автоустановка пакетов поддерживается только в Ubuntu и Debian с apt-get.")
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
-    print(colored("  ◷ Обновляю индекс пакетов…", "blue"))
+    pending("Обновляю индекс пакетов…")
     subprocess.run(["apt-get", "update"], check=True, timeout=600, env=env)
-    print(colored("  ◷ Устанавливаю: " + ", ".join(packages), "blue"))
+    pending("Устанавливаю: " + ", ".join(packages))
     subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", *packages],
                    check=True, timeout=900, env=env)
 
@@ -132,7 +219,7 @@ def ensure_dependencies(auto_install=False):
     if packages and not auto_install:
         raise ValueError("Не установлены пакеты: " + ", ".join(packages) + ".")
     if packages:
-        print(colored("  Найдены отсутствующие пакеты: " + ", ".join(packages), "yellow"))
+        warn("Найдены отсутствующие пакеты: " + ", ".join(packages))
         apt_install(packages)
     remaining = missing_packages()
     if remaining:
@@ -141,7 +228,7 @@ def ensure_dependencies(auto_install=False):
         raise ValueError("Не найдены systemctl/journalctl; требуется systemd.")
     if not Path("/run/systemd/system").is_dir():
         raise ValueError("systemd установлен, но не работает как система инициализации.")
-    print(colored("  ✓ Зависимости проверены.", "green"))
+    ok("Зависимости проверены.")
 
 
 def networks(text):
@@ -198,7 +285,7 @@ def journal_top(text):
 
 
 def safe_label(value):
-    return "".join(ch for ch in str(value) if ch.isprintable())[:70]
+    return "".join(ch for ch in str(value) if ch.isprintable())[:LABEL_LIMIT]
 
 
 def rdap_label(data):
@@ -210,7 +297,7 @@ def rdap_label(data):
             for field in card[1]:
                 if len(field) >= 4 and field[0] in ("org", "fn"):
                     names.append(safe_label(field[3]))
-    return " / ".join(dict.fromkeys(names))[:100] or network
+    return safe_label(" / ".join(dict.fromkeys(names))) or network
 
 
 def rdap_lookup(ip):
@@ -267,22 +354,40 @@ def top(resolve=True):
     text = journal.stdout
     rows = journal_top(text)
     labels = lookup_many([ip for ip, _ in rows]) if resolve and rows else {}
+    width = terminal_width()
+    ip_w = max([len(ip) for ip, _ in rows] + [15])
+    # On very narrow consoles, preserve the table within the available width.
+    ip_w = min(ip_w, max(15, width - 25))
+    org_w = max(8, width - 19 - ip_w)
+    if 17 + ip_w + org_w > width:
+        org_w = max(1, width - 17 - ip_w)
     print()
-    rule("─", style="blue")
-    print(colored("  ТОП-10 ЗАБЛОКИРОВАННЫХ IP", "blue", "bold"))
-    print(colored("  Период: 24 часа · анализ: до 10 000 записей журнала", "dim"))
-    print(colored("  Это записи блокировок, а не число сканирований или атак.", "yellow"))
+    rule("─", width, "blue")
+    print_fit("ТОП-10 ЗАБЛОКИРОВАННЫХ IP", "blue", "bold")
+    print_fit("Период: 24 часа · анализ: до 10 000 записей журнала", "dim")
+    print_fit("Это записи блокировок, а не число сканирований или атак.", "yellow")
     if resolve and rows:
-        print(colored("  Организация: внешний RDAP · кэш 7 дней", "magenta"))
+        print_fit("Организация: внешний RDAP · кэш 7 дней", "magenta")
     print()
-    print(colored(f"  {'№':<3} {'IP':<39} {'Пакетов':>8}  Организация / сеть", "cyan", "bold"))
-    for index, (ip, count) in enumerate(rows, 1):
-        label = labels[ip] if resolve else "Расшифровка отключена"
-        print(f"  {index:<3} {colored(f'{ip:<39}', 'white')} {colored(f'{count:>8}', 'yellow')}  {colored(label, 'magenta')}")
+    if width < 33:
+        print_fit("№  IP / пакеты", "cyan", "bold")
+        for index, (ip, count) in enumerate(rows, 1):
+            print_fit(f"{index}. {ip} / {count}", "white")
+            print_fit((labels[ip] if resolve else "—"), "magenta", indent=4)
+    else:
+        heading = f"  {'№':<3} {'IP':<{ip_w}} {'Пакетов':>8}  {'Организация / сеть':<{org_w}}"
+        print(colored(heading[:width], "cyan", "bold"))
+        for index, (ip, count) in enumerate(rows, 1):
+            label = labels[ip] if resolve else "—"
+            label = safe_label(label)[:org_w]
+            shown_ip = ip[:ip_w]
+            print(f"  {colored(f'{index:<3}', 'dim')} {colored(f'{shown_ip:<{ip_w}}', 'white')} "
+                  f"{colored(f'{count:>8}', 'yellow')}  {colored(f'{label:<{org_w}}', 'magenta')}")
     if not rows:
-        print(colored("  ○ За последние 24 часа заблокированных обращений пока нет.", "dim"))
-    print(colored("  Владелец сети не обязательно отправитель или хостер.", "dim"))
-    rule("─", style="blue")
+        info("За последние 24 часа заблокированных обращений пока нет.")
+    else:
+        info("Владелец сети не обязательно отправитель или хостер.")
+    rule("─", width, "blue")
 
 
 def journal_output(*args):
@@ -301,12 +406,18 @@ def print_logs():
     print(colored("  ПОСЛЕДНИЕ БЛОКИРОВКИ", "magenta", "bold"))
     blocked = journal_output("-k", "--since", "24 hours ago", "--grep=CBTC[46] ",
                              "-n", "30", "-o", "short-iso", "--no-pager")
-    print(blocked or colored("  ○ За последние 24 часа записей нет.", "dim"))
+    if blocked:
+        print(blocked)
+    else:
+        info("За последние 24 часа записей нет.")
     print()
     print(colored("  ОБНОВЛЕНИЕ ВНЕШНИХ СПИСКОВ", "magenta", "bold"))
     updates = journal_output("-u", UNIT + "-update.service", "--since", "7 days ago",
                              "-n", "20", "-o", "short-iso", "--no-pager")
-    print(updates or colored("  ○ За последние 7 дней записей нет.", "dim"))
+    if updates:
+        print(updates)
+    else:
+        info("За последние 7 дней записей нет.")
     rule()
 
 
@@ -483,7 +594,7 @@ def unit_state(action, name):
 
 def format_updated(timestamp):
     try:
-        return datetime.fromtimestamp(timestamp).astimezone().strftime("%d.%m.%Y %H:%M:%S %Z")
+        return datetime.fromtimestamp(timestamp).astimezone().strftime("%d.%m.%Y %H:%M")
     except (OSError, OverflowError, TypeError, ValueError):
         return "неизвестно"
 
@@ -499,35 +610,35 @@ def component_report(state):
     service_enabled = unit_state("is-enabled", UNIT + ".service") == "enabled"
     timer_active = unit_state("is-active", UNIT + "-update.timer") == "active"
     if pending:
-        protection = colored("◷ ПРОБНОЕ ВКЛЮЧЕНИЕ", "yellow", "bold")
+        filtering = colored(symbol("pending") + " ПРОБНОЕ ВКЛЮЧЕНИЕ", "yellow", "bold")
     elif enabled and table:
-        protection = colored("✓ АКТИВНА", "green", "bold")
+        filtering = colored(symbol("ok") + " АКТИВНА", "green", "bold")
     elif enabled:
-        protection = colored("✗ ТРЕБУЕТ ВОССТАНОВЛЕНИЯ", "red", "bold")
+        filtering = colored(symbol("error") + " ТРЕБУЕТ ВОССТАНОВЛЕНИЯ", "red", "bold")
     else:
-        protection = colored("○ ВЫКЛЮЧЕНА", "yellow", "bold")
+        filtering = colored(symbol("idle") + " ВЫКЛЮЧЕНА", "yellow", "bold")
     print()
     rule("─", style="blue")
     print(colored("  ОТЧЁТ О РАБОТЕ КОМПОНЕНТОВ", "blue", "bold"))
     print()
-    print(f"  Защита входящего трафика : {protection}")
+    print(f"  Фильтрация входящего трафика : {filtering}")
     if table:
         table_status = status_mark(True, "ЗАГРУЖЕНА")
     elif enabled or pending:
         table_status = status_mark(False, bad="ОТСУТСТВУЕТ")
     else:
-        table_status = colored("○ не загружена — защита выключена", "yellow")
+        table_status = colored(symbol("idle") + " не загружена — фильтрация выключена", "yellow")
     print(f"  Таблица nftables          : {table_status}")
     if enabled:
         startup = status_mark(service_enabled, "ВКЛЮЧЕНО", "ВЫКЛЮЧЕНО")
         updates = status_mark(timer_active, "АКТИВНО", "НЕАКТИВНО")
     else:
-        startup = colored("○ включится после подтверждения защиты", "yellow")
-        updates = colored("○ включится после подтверждения защиты", "yellow")
+        startup = colored(symbol("idle") + " включится после подтверждения фильтрации", "yellow")
+        updates = colored(symbol("idle") + " включится после подтверждения фильтрации", "yellow")
     print(f"  Восстановление при старте : {startup}")
     print(f"  Ежедневное обновление     : {updates}")
     print(f"  Внешние списки            : {sum(len(x) for x in state['lists'].values())} сетей/адресов")
-    print(f"  Разрешённые IP            : {len(state['allow'])}")
+    print(f"  Исключения                : {len(state['allow'])}")
     print(f"  Журналирование блокировок : {'ВКЛЮЧЕНО' if state.get('logging') else 'ВЫКЛЮЧЕНО'}")
     print(f"  Последнее обновление      : {format_updated(state.get('updated'))}")
     rule("─", style="blue")
@@ -550,21 +661,21 @@ def ip_list(value):
 def ask_yes(label):
     while True:
         answer = input(label + " [Д/Н]: ").strip().lower()
-        if answer in ("д", "да", "y", "yes"):
+        if answer in ("д", "да"):
             return True
-        if answer in ("н", "нет", "n", "no"):
+        if answer in ("н", "нет"):
             return False
-        print("Введите Д или Н.")
+        warn("Введите Д или Н.")
 
 
 def brand_header():
     print()
     rule()
-    print(colored("  ЧебурNET · TRAFFIC CONTROL", "cyan", "bold"))
-    print(colored("  УПРАВЛЕНИЕ ЗАЩИТОЙ ВХОДЯЩЕГО ТРАФИКА", "magenta", "bold"))
-    print(colored("  Тестовая версия · " + VERSION, "yellow"))
-    print(colored("  Автор и разработчик: Леонид Копысов", "white"))
-    print(colored("  GitHub: leonidkopysov · Telegram: @kopysovleonid", "dim"))
+    print_fit("ЧебурNET · TRAFFIC CONTROL", "cyan", "bold")
+    print_fit("УПРАВЛЕНИЕ ФИЛЬТРАЦИЕЙ ВХОДЯЩЕГО ТРАФИКА", "magenta", "bold")
+    print_fit("Тестовая версия · " + VERSION, "yellow")
+    print_fit("Автор и разработчик: Леонид Копысов", "white")
+    print_fit("GitHub: leonidkopysov · Telegram: @kopysovleonid", "dim")
     rule()
 
 
@@ -578,8 +689,8 @@ def confirm_install_start(confirmed=False):
     print()
     print("  Скрипт проверит зависимости, загрузит три внешних списка,")
     print("  сохранит конфигурацию и установит службы восстановления.")
-    print(colored("  Фильтрация не включится до отдельной пробной активации.", "yellow", "bold"))
-    print(colored("  Держите доступ к консоли VPS до завершения проверки.", "red", "bold"))
+    warn("Фильтрация не включится до отдельной пробной активации.")
+    warn("Держите доступ к консоли VPS до завершения проверки.")
     print()
     if not ask_yes("  Продолжить установку?"):
         raise ValueError("Установка отменена пользователем.")
@@ -587,14 +698,14 @@ def confirm_install_start(confirmed=False):
 
 def ask_value(label, candidate, validator):
     if candidate:
-        print(label + ": " + candidate)
-        if ask_yes("Верно?"):
+        info(label + ": " + candidate)
+        if ask_yes("  Верно?"):
             return validator(candidate)
     while True:
         try:
-            return validator(input(label + " (введите своё значение): ").strip())
+            return validator(input("  " + label + " (введите своё значение): ").strip())
         except (ValueError, OSError):
-            print("Некорректное значение. Повторите ввод.")
+            warn("Некорректное значение. Повторите ввод.")
 
 
 def panel_hint(path=Path('/opt/remnanode/settings.json')):
@@ -618,11 +729,11 @@ def panel_input(value):
         # Domain only: not a URL, port, CIDR, shell command or list of hostnames.
         if not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?', value):
             raise ValueError('Укажите IP или домен без https:// и пути.')
-        print('DNS домена может указывать на CDN, а не исходящий IP панели!')
+        warn('DNS домена может указывать на CDN, а не исходящий IP панели.')
         addresses = sorted(set(host(item[4][0]) for item in socket.getaddrinfo(
             value, None, type=socket.SOCK_STREAM)))
-        print('Найдены адреса: ' + ', '.join(addresses))
-        if not addresses or not ask_yes('Это именно исходящие IP панели?'):
+        info('Найдены адреса: ' + ', '.join(addresses))
+        if not addresses or not ask_yes('  Это именно исходящие IP панели?'):
             raise ValueError('Введите исходящий IP панели вручную.')
         return addresses
 
@@ -643,13 +754,13 @@ def install_inputs(args):
             port = str(port_list(connection[3])[0])
         except ValueError:
             admin, port = '', ''
-    print('IP SSH-клиента может принадлежать VPN, NAT или промежуточному серверу.')
+    info('IP SSH-клиента может принадлежать VPN, NAT или промежуточному серверу.')
     admins = ask_value('IP администратора', admin, ip_list)
     ports = ask_value('Порт SSH', port, port_list)
     panel = ask_value('Исходящие IP панели (или её домен для поиска)', panel_hint(), panel_input)
     allowed = sorted(set(admins + panel))
-    print('Итог: SSH ' + ', '.join(map(str, ports)) + '; исключения IP: ' + ', '.join(allowed))
-    if not ask_yes('Установить с этими настройками?'):
+    info('Итог: SSH ' + ', '.join(map(str, ports)) + '; исключения IP: ' + ', '.join(allowed))
+    if not ask_yes('  Установить с этими настройками?'):
         raise ValueError('Установка отменена. Настройки не записаны.')
     return ports, allowed
 
@@ -692,21 +803,22 @@ def install(args):
             except OSError:
                 pass
         raise
-    print(colored("  ✓ Компонент установлен, конфигурация сохранена.", "green", "bold"))
-    print(colored("  ○ Фильтрация пока выключена. Для проверки выберите пробное включение в меню.", "yellow"))
+    ok("Компонент установлен, конфигурация сохранена.")
+    info("Фильтрация пока выключена. Для проверки выберите пробное включение в меню.")
 
 
 def activate():
     state = load()
     if (ROOT / "enabled").exists() or (ROOT / "pending").exists():
-        raise ValueError("Защита уже включена или ожидает подтверждения. Выполните: ctc s")
+        raise ValueError("Фильтрация уже включена или ожидает подтверждения. "
+                         "Выполните cheburnet-traffic-control status.")
     atomic(ROOT / "pending", str(time.time()))
     run("systemctl", "restart", UNIT + "-rollback.timer")
     apply(state)
-    print(colored("  ◷ Защита пробно включена на 120 секунд.", "yellow", "bold"))
-    print("  Проверьте НОВОЕ SSH-подключение, панель и VPN.")
-    print(colored("  Если всё работает, подтвердите: ctc ok", "green", "bold"))
-    print(colored("  Без подтверждения правила будут автоматически удалены.", "red"))
+    pending("Фильтрация пробно включена на 120 секунд.")
+    info("Проверьте новое SSH-подключение, панель и VPN.")
+    ok("Если всё работает, выполните cheburnet-traffic-control confirm.")
+    warn("Без подтверждения правила будут автоматически удалены.")
 
 
 def disable(units=True):
@@ -716,7 +828,7 @@ def disable(units=True):
     if units:
         run("systemctl", "disable", "--now", UNIT + "-update.timer", check=False)
         run("systemctl", "disable", UNIT + ".service", check=False)
-    print(colored("  ○ Защита ЧебурNET выключена; остальные правила firewall не изменены.", "yellow"))
+    info("Фильтрация ЧебурNET выключена; остальные правила firewall не изменены.")
 
 
 def file_is_secure(path, executable=False):
@@ -793,7 +905,7 @@ def diagnostic_items(state):
         table = False
     if pending:
         add("Пробное включение", table and unit_state("is-active", UNIT + "-rollback.timer") == "active",
-            "защитный таймер активен")
+            "таймер отката активен")
     elif enabled:
         add("Рабочая таблица", table, "загружена" if table else "отсутствует")
         service_ok = unit_state("is-enabled", UNIT + ".service") == "enabled"
@@ -813,21 +925,23 @@ def print_diagnostics(state):
     print(colored("  САМОДИАГНОСТИКА ЧЕБУРNET", "cyan", "bold"))
     print()
     for name, ok, detail in items:
-        mark = colored("✓", "green", "bold") if ok else colored("✗", "red", "bold")
+        mark = colored(symbol("ok"), "green", "bold") if ok else colored(symbol("error"), "red", "bold")
         print(f"  {mark} {name}: {detail}")
     failed = sum(not ok for _, ok, _ in items)
     print()
     if failed:
-        print(colored(f"  Обнаружено проблем: {failed}. Запустите: ctc fix", "red", "bold"))
+        err(f"Обнаружено проблем: {failed}. "
+            "Выполните cheburnet-traffic-control repair.")
     else:
-        print(colored("  ✓ Все проверяемые компоненты работают штатно.", "green", "bold"))
+        ok("Все проверяемые компоненты работают штатно.")
     rule()
     return failed
 
 
 def repair(state, confirmed=False):
     if (ROOT / "pending").exists():
-        raise ValueError("Сначала завершите пробное включение командой ctc ok либо ctc off.")
+        raise ValueError("Сначала выполните cheburnet-traffic-control confirm либо "
+                         "cheburnet-traffic-control disable.")
     if not confirmed:
         if not sys.stdin.isatty():
             raise ValueError("Для автоматического восстановления добавьте --yes.")
@@ -855,22 +969,28 @@ def repair(state, confirmed=False):
         remove_table()
         run("systemctl", "disable", "--now", UNIT + "-update.timer", check=False)
         run("systemctl", "disable", "--now", UNIT + ".service", check=False)
-    print(colored("  ✓ Восстановление завершено. Повторяю диагностику.", "green", "bold"))
+    ok("Восстановление завершено. Повторяю диагностику.")
     return print_diagnostics(state)
 
 
 def print_status(state):
-    component_report(state)
     print()
-    print(colored("  НАСТРОЙКИ", "cyan", "bold"))
+    rule("─", style="blue")
+    print(colored("  СОСТОЯНИЕ", "blue", "bold"))
+    print()
     print(f"  Версия                    : {VERSION}")
-    print(f"  Порты SSH                 : {', '.join(map(str, state['ssh_ports']))}")
-    print(f"  Разрешённые IP            : {', '.join(state['allow'])}")
-    print(f"  Ручные блокировки         : {len(state['manual'])}")
+    print(f"  Таблица nftables           : {'создана' if present() else 'отсутствует'}")
+    print(f"  Фильтрация              : {'включена' if (ROOT / 'enabled').exists() else 'выключена'}")
+    print(f"  Подтверждение             : {'ожидается' if (ROOT / 'pending').exists() else 'не требуется'}")
+    print(f"  Списки обновлены        : {format_updated(state.get('updated'))}")
     for name, entries in state["lists"].items():
-        print(f"  Список {name:<18}: {len(entries)} записей")
+        print(f"    {name:<22} {len(entries):>7} записей")
+    print(f"  Порты SSH                 : {', '.join(map(str, state['ssh_ports']))}")
+    print(f"  Исключения                : {', '.join(state['allow'])}")
+    print(f"  Ручные блокировки        : {', '.join(state['manual']) or '—'}")
     print()
-    print(colored("  Полные правила: ctc r", "dim"))
+    info("Полные правила: cheburnet-traffic-control rules")
+    rule("─", style="blue")
 
 
 def print_rules():
@@ -879,8 +999,9 @@ def print_rules():
     print(colored("  ПОЛНЫЕ ПРАВИЛА NFTABLES", "cyan", "bold"))
     rule()
     if not present():
-        print(colored("  ○ Таблица ЧебурNET сейчас не загружена.", "yellow"))
+        info("Таблица ЧебурNET сейчас не загружена.")
         return
+    print(colored("  Ниже приведён неизменённый вывод nftables:", "dim"))
     print(run("nft", "list", "table", "inet", TABLE, timeout=300).stdout)
 
 
@@ -914,7 +1035,8 @@ def execute(args):
     elif cmd == "confirm":
         pending = ROOT / "pending"
         if not pending.exists() or time.time() - float(pending.read_text(encoding="utf-8")) >= 120 or not present():
-            raise ValueError("Нет действующего пробного включения; выполните ctc on снова.")
+            raise ValueError("Нет действующего пробного включения; выполните "
+                             "cheburnet-traffic-control activate снова.")
         atomic(ROOT / "enabled", "1\n")
         try:
             run("systemctl", "enable", UNIT + ".service")
@@ -924,7 +1046,7 @@ def execute(args):
             raise
         pending.unlink()
         run("systemctl", "stop", UNIT + "-rollback.timer")
-        print(colored("  ✓ Защита подтверждена: восстановление и обновление включены.", "green", "bold"))
+        ok("Фильтрация подтверждена: восстановление и обновление включены.")
     elif cmd == "rollback":
         if (ROOT / "pending").exists():
             disable()
@@ -946,10 +1068,12 @@ def execute(args):
             SHORT_BIN.unlink(missing_ok=True)
         BIN.unlink(missing_ok=True)
         run("systemctl", "daemon-reload")
-        print("✓ Программа, короткая команда и службы удалены. Конфигурация сохранена в " + str(ROOT))
+        ok("Удаление завершено: программа, короткая команда и службы удалены.")
+        info("Конфигурация сохранена в " + str(ROOT))
     elif cmd in ("update", "ban", "unban", "allow", "disallow"):
         if (ROOT / "pending").exists():
-            raise ValueError("Сначала подтвердите или выключите пробный режим: ctc ok либо ctc off.")
+            raise ValueError("Сначала выполните cheburnet-traffic-control confirm либо "
+                             "cheburnet-traffic-control disable.")
         old = json.loads(json.dumps(state))
         if cmd == "update":
             state["lists"] = fetch_lists()
@@ -972,10 +1096,10 @@ def execute(args):
                     raise ValueError("Нельзя удалить последнее исключение.")
         commit(state, old)
         action = "Три внешних списка обновлены." if cmd == "update" else "Изменения сохранены."
-        print(colored("  ✓ " + action, "green", "bold"))
-        print("  Исключения и SSH имеют приоритет над блокировками.")
+        ok(action)
+        info("Исключения и SSH имеют приоритет над блокировками.")
         if cmd == "unban":
-            print("Удалён только ручной бан. Для исключения из внешних списков используйте allow IP.")
+            info("Удалена только точная ручная блокировка. Для внешнего списка добавьте IP в исключения.")
 
 
 def menu():
@@ -989,36 +1113,40 @@ def menu():
                 state = load()
                 component_report(state)
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
-                print(colored("  ✗ Отчёт недоступен: " + safe_label(exc), "red", "bold"))
+                err("Отчёт недоступен: " + safe_label(exc))
         else:
             print()
-            print(colored("  ○ Компонент ещё не установлен.", "yellow", "bold"))
+            info("Компонент ещё не установлен.")
         print()
         print(colored("  ГЛАВНОЕ МЕНЮ", "magenta", "bold"))
         print()
         if not installed:
-            menu_line("1", "Установить компонент (защита останется выключенной)", "green")
+            menu_line("1", "Установить компонент (фильтрация останется выключенной)", "green")
         else:
+            menu_section("Состояние и списки")
             menu_line("1", "Показать краткое состояние", "blue")
             menu_line("2", "Обновить три внешних списка", "blue")
+            menu_line("11", "Самодиагностика и исправление", "magenta")
+            menu_line("12", "Показать полные правила nftables", "blue")
+            menu_line("13", "Показать последние журналы", "blue")
+            menu_section("Блокировки и исключения")
             menu_line("3", "Добавить ручной бан IP или CIDR", "yellow")
             menu_line("4", "Снять точный ручной бан", "green")
             menu_line("5", "Добавить IP в исключения", "green")
             menu_line("6", "Удалить IP из исключений", "yellow")
-            menu_line("7", "Пробно включить защиту на 120 секунд", "yellow")
+            menu_section("Включение и подтверждение")
+            menu_line("7", "Пробно включить фильтрацию на 120 секунд", "yellow")
             menu_line("8", "Подтвердить пробное включение", "green")
-            menu_line("9", "Выключить защиту", "yellow")
-            menu_line("10", "Удалить компонент", "red")
-            menu_line("11", "Самодиагностика и исправление", "magenta")
-            menu_line("12", "Показать полные правила nftables", "blue")
-            menu_line("13", "Показать последние журналы", "blue")
+            menu_line("9", "Выключить фильтрацию", "yellow")
+            menu_section("Удаление")
+            menu_line("10", "Удаление программы и служб", "red")
         menu_line("0", "Выход", "white")
         if installed:
             try:
                 top()
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 print()
-                print(colored("  ✗ Топ-10 временно недоступен: " + safe_label(exc), "red"))
+                err("Топ-10 временно недоступен: " + safe_label(exc))
         print()
         rule("─", style="cyan")
         choice = input(colored("  Выберите действие: ", "cyan", "bold")).strip()
@@ -1035,7 +1163,7 @@ def menu():
         if command in ("ban", "unban", "allow", "disallow"):
             args.append(input(colored("  IP (для ручного бана также CIDR): ", "cyan")).strip())
         if command == "uninstall":
-            if input(colored("  Удалить компонент? Введите Д: ", "red", "bold")).strip().lower() != "д":
+            if input(colored("  Выполнить удаление? Введите Д: ", "red", "bold")).strip().lower() != "д":
                 continue
             args.append("--yes")
         try:
@@ -1043,7 +1171,7 @@ def menu():
             if command == "check" and problems and ask_yes("  Исправить обнаруженные проблемы?"):
                 main(["repair", "--yes"])
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
-            print(colored("  ✗ " + str(exc), "red", "bold"))
+            err(str(exc))
         if command == "uninstall":
             return
         if command == "install":
@@ -1058,6 +1186,40 @@ def normalize_argv(argv):
     return values
 
 
+class RussianArgumentParser(argparse.ArgumentParser):
+    """Argparse shell with Russian headings and explicit Russian help option."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("add_help", False)
+        super().__init__(*args, **kwargs)
+        self.add_argument("-h", "--help", action="help", help="показать эту справку и выйти")
+        self._positionals.title = "позиционные аргументы"
+        self._optionals.title = "параметры"
+
+    def format_usage(self):
+        return super().format_usage().replace("usage:", "использование:", 1)
+
+    def format_help(self):
+        return (super().format_help()
+                .replace("usage:", "использование:", 1)
+                .replace("options:", "параметры:", 1)
+                .replace("positional arguments:", "позиционные аргументы:", 1))
+
+    def error(self, message):
+        translations = {
+            "the following arguments are required:": "необходимо указать:",
+            "unrecognized arguments:": "неизвестные параметры:",
+            "invalid choice:": "недопустимый вариант:",
+            "argument ": "аргумент ",
+            "(choose from ": "(доступно: ",
+            "expected one argument": "ожидается одно значение",
+        }
+        for source, target in translations.items():
+            message = message.replace(source, target)
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: ошибка: {message}\n")
+
+
 def main(argv=None):
     direct_invocation = argv is None
     argv = normalize_argv(sys.argv[1:] if argv is None else argv)
@@ -1068,39 +1230,56 @@ def main(argv=None):
             raise ValueError("Запуск только от root.")
         menu()
         return
-    parser = argparse.ArgumentParser(
-        description="ЧебурNET Traffic Control — управление защитой входящего трафика. Тестовая версия.")
-    parser.add_argument("--version", action="version", version=VERSION, help="показать версию")
-    subs = parser.add_subparsers(dest="command", required=True, title="команды")
-    inst = subs.add_parser("install", help="установить компонент без включения защиты")
-    inst.add_argument("--ssh-port", action="append", type=int, help="порт SSH; можно указать несколько раз")
-    inst.add_argument("--allow", action="append", default=[], help="разрешённый IP; можно указать несколько раз")
-    inst.add_argument("--yes", action="store_true", help="Подтвердить автоматическую установку")
-    inst.add_argument("--no-logging", action="store_false", dest="logging", help="отключить журнал блокировок")
+    parser = RussianArgumentParser(
+        prog="cheburnet-traffic-control",
+        usage="%(prog)s [--version] КОМАНДА [ПАРАМЕТРЫ]",
+        description="ЧебурNET Traffic Control — управление фильтрацией входящего трафика. Тестовая версия.")
+    parser.add_argument("--version", action="version", version=VERSION,
+                        help="показать номер версии и выйти")
+    subs = parser.add_subparsers(dest="command", required=True, title="команды", metavar="КОМАНДА")
+    inst = subs.add_parser("install", prog=parser.prog + " install", usage="%(prog)s [ПАРАМЕТРЫ]",
+                           help="установить компонент без включения фильтрации")
+    inst.add_argument("--ssh-port", action="append", type=int, metavar="ПОРТ",
+                      help="порт SSH; параметр можно указать несколько раз")
+    inst.add_argument("--allow", action="append", default=[], metavar="IP",
+                      help="добавить IP в исключения; параметр можно указать несколько раз")
+    inst.add_argument("--yes", action="store_true",
+                      help="подтвердить автоматическую установку без вопросов")
+    inst.add_argument("--no-logging", action="store_false", dest="logging",
+                      help="отключить журналирование блокировок")
     inst.set_defaults(logging=True)
-    top_parser = subs.add_parser("top", help="показать топ-10 заблокированных IP")
-    top_parser.add_argument("--no-resolve", action="store_true", help="не запрашивать организации через RDAP")
-    status_parser = subs.add_parser("status", help="показать краткий отчёт")
-    status_parser.add_argument("--json", action="store_true", help="вывести машинный JSON")
+    top_parser = subs.add_parser("top", prog=parser.prog + " top", usage="%(prog)s [--no-resolve]",
+                                 help="показать топ-10 заблокированных IP")
+    top_parser.add_argument("--no-resolve", action="store_true",
+                            help="не запрашивать сведения об организациях через RDAP")
+    status_parser = subs.add_parser("status", prog=parser.prog + " status", usage="%(prog)s [--json]",
+                                    help="показать краткий отчёт")
+    status_parser.add_argument("--json", action="store_true",
+                               help="вывести неизменённый машинный отчёт JSON")
     command_help = {
         "rules": "показать полные правила nftables", "logs": "показать последние журналы",
         "check": "выполнить самодиагностику",
-        "activate": "пробно включить защиту", "confirm": "подтвердить пробное включение",
-        "disable": "выключить защиту", "restore": "восстановить правила из локальной копии",
+        "activate": "пробно включить фильтрацию", "confirm": "подтвердить пробное включение",
+        "disable": "выключить фильтрацию", "restore": "восстановить правила из локальной копии",
         "rollback": "выполнить аварийный откат", "update": "обновить три внешних списка",
     }
     for cmd, help_text in command_help.items():
-        subs.add_parser(cmd, help=help_text)
-    repair_parser = subs.add_parser("repair", help="исправить обнаруженные проблемы")
-    repair_parser.add_argument("--yes", action="store_true", help="подтвердить автоматическое восстановление")
+        subs.add_parser(cmd, prog=parser.prog + " " + cmd, usage="%(prog)s", help=help_text)
+    repair_parser = subs.add_parser("repair", prog=parser.prog + " repair", usage="%(prog)s [--yes]",
+                                    help="исправить обнаруженные проблемы")
+    repair_parser.add_argument("--yes", action="store_true",
+                               help="подтвердить автоматическое восстановление без вопросов")
     address_help = {
         "ban": "добавить ручную блокировку", "unban": "удалить точную ручную блокировку",
         "allow": "добавить IP в исключения", "disallow": "удалить IP из исключений",
     }
     for cmd, help_text in address_help.items():
-        subs.add_parser(cmd, help=help_text).add_argument("address", help="IP или допустимый CIDR")
-    uninstall_parser = subs.add_parser("uninstall", help="удалить программу и службы")
-    uninstall_parser.add_argument("--yes", action="store_true", help="подтвердить удаление")
+        subs.add_parser(cmd, prog=parser.prog + " " + cmd, usage="%(prog)s АДРЕС", help=help_text).add_argument(
+            "address", metavar="АДРЕС", help="IP или допустимый CIDR")
+    uninstall_parser = subs.add_parser("uninstall", prog=parser.prog + " uninstall", usage="%(prog)s [--yes]",
+                                       help="удалить программу и службы")
+    uninstall_parser.add_argument("--yes", action="store_true",
+                                  help="подтвердить удаление без дополнительного вопроса")
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
         raise ValueError("Запуск только от root.")
@@ -1135,13 +1314,16 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n○ Операция прервана пользователем.", file=sys.stderr)
+        print(file=sys.stderr)
+        message("info", "Операция прервана пользователем.", file=sys.stderr)
         sys.exit(130)
     except EOFError:
-        print("\n✗ Ввод завершён до окончания операции.", file=sys.stderr)
+        print(file=sys.stderr)
+        err("Ввод завершён до окончания операции.", file=sys.stderr)
         sys.exit(1)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
-        print("✗ " + str(exc), file=sys.stderr)
+        err(str(exc), file=sys.stderr)
         if isinstance(exc, subprocess.CalledProcessError):
-            print(exc.stderr, file=sys.stderr)
+            if exc.stderr:
+                print("  " + exc.stderr.strip(), file=sys.stderr)
         sys.exit(1)
