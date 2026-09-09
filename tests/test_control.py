@@ -73,6 +73,12 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             self.assertIn("-c", run.call_args.args)
 
+    def test_nft_apply_uses_extended_timeout(self):
+        with patch.object(c, "present", return_value=False), patch.object(c, "run") as run:
+            c.apply(self.state())
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(all(call.kwargs["timeout"] == 300 for call in run.call_args_list))
+
     def test_atomic(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "state.json"
@@ -105,6 +111,16 @@ class ControlTests(unittest.TestCase):
     def test_rdap_owner(self):
         self.assertEqual(c.rdap_label({"entities": [{"roles": ["registrant"],
             "vcardArray": ["vcard", [["org", {}, "text", "Example Hosting"]]]}]}), "Example Hosting")
+
+    def test_rdap_batch_uses_cache_and_resolves_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            cache = {"1.1.1.1": {"time": c.time.time(), "label": "Cloudflare"}}
+            (root / "rdap-cache.json").write_text(json.dumps(cache), encoding="utf-8")
+            with patch.object(c, "ROOT", root), patch.object(c, "rdap_lookup", return_value="Google") as lookup:
+                labels = c.lookup_many(["1.1.1.1", "8.8.8.8"])
+            self.assertEqual(labels, {"1.1.1.1": "Cloudflare", "8.8.8.8": "Google"})
+            lookup.assert_called_once_with("8.8.8.8")
 
     def test_interactive_accept(self):
         with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.dict(c.os.environ, {'SSH_CONNECTION': '1.2.3.4 50000 5.6.7.8 2222'}), patch.object(c, 'panel_hint', return_value='9.8.7.6'), patch('builtins.input', side_effect=['д', 'д', 'д', 'д']):
@@ -152,16 +168,66 @@ class ControlTests(unittest.TestCase):
         with patch.object(c.sys.stdout, 'isatty', return_value=True), patch.dict(c.os.environ, {}, clear=True):
             self.assertIn('\033[92m', c.colored('Тест', 'green'))
 
-    def test_vertical_menu(self):
+    def test_vertical_menu_before_install(self):
         output = io.StringIO()
         with patch.object(c.sys.stdout, 'isatty', return_value=False), patch.object(c, 'STATE') as state, patch('builtins.input', return_value='0'), patch('sys.stdout', output):
             state.exists.return_value = False
             c.menu()
         text = output.getvalue()
         self.assertIn('ТЕСТОВАЯ ВЕРСИЯ', text)
+        self.assertIn('[ 1]  Установить компонент', text)
+        self.assertNotIn('[10]  Удалить компонент', text)
+        self.assertNotIn('\033[', text)
+
+    def test_vertical_menu_after_install(self):
+        output = io.StringIO()
+        with patch.object(c.sys.stdout, 'isatty', return_value=False), patch.object(c, 'STATE') as state, patch.object(c, 'menu_status', return_value='АКТИВЕН'), patch.object(c, 'main') as main, patch('builtins.input', return_value='0'), patch('sys.stdout', output):
+            state.exists.return_value = True
+            c.menu()
+        text = output.getvalue()
         self.assertIn('[ 1]  Показать состояние', text)
         self.assertIn('[10]  Удалить компонент', text)
-        self.assertNotIn('\033[', text)
+        main.assert_called_once_with(['top'])
+
+    def test_menu_requires_root_before_opening(self):
+        with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.object(c.os, 'geteuid', return_value=1000), patch.object(c, 'menu') as menu, self.assertRaises(ValueError):
+            c.main([])
+        menu.assert_not_called()
+
+    def test_dependency_error_is_value_error_not_parser_exit(self):
+        with patch.object(c.os, 'geteuid', return_value=0), patch.object(c, 'ensure_dependencies', side_effect=ValueError('нет nft')), self.assertRaisesRegex(ValueError, 'нет nft'):
+            c.main(['status'])
+
+    def test_restore_pending_does_not_manage_systemd_units(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'pending').touch()
+            with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), patch.object(c, 'disable') as disable:
+                c.execute(Namespace(command='restore'))
+            disable.assert_called_once_with(units=False)
+
+    def test_failed_install_removes_partial_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            root, systemd = base / 'state', base / 'systemd'
+            systemd.mkdir()
+            binary, state_file = base / 'bin', root / 'state.json'
+
+            def fake_run(*args, **kwargs):
+                if args == ('systemctl', 'daemon-reload') and kwargs.get('check', True):
+                    raise OSError('daemon-reload failed')
+
+            lists = {'test': ['198.51.100.0/24']}
+            with patch.object(c, 'ROOT', root), patch.object(c, 'STATE', state_file), \
+                 patch.object(c, 'BIN', binary), patch.object(c, 'SYSTEMD', systemd), \
+                 patch.object(c, 'present', return_value=False), \
+                 patch.object(c, 'install_inputs', return_value=([22], ['198.51.100.9'])), \
+                 patch.object(c, 'fetch_lists', return_value=lists), \
+                 patch.object(c, 'run', side_effect=fake_run), self.assertRaises(OSError):
+                c.install(Namespace(logging=True))
+            self.assertFalse(binary.exists())
+            self.assertFalse(state_file.exists())
+            self.assertFalse(any((systemd / name).exists() for name in c.service_files()))
 
     def test_os_release(self):
         with tempfile.TemporaryDirectory() as folder:
