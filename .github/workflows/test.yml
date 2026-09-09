@@ -1,0 +1,12 @@
+name: Проверка
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests -v
+      - run: python3 -m py_compile cheburnet-traffic-control.py
+      - run: sha256sum -c SHA256SUMS
