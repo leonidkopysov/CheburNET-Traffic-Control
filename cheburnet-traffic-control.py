@@ -24,7 +24,8 @@ import textwrap
 import time
 import urllib.request
 
-VERSION = "0.1.0-alpha.8"
+VERSION = "0.1.0-alpha.9"
+WIDTH = 78
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")
 STATE = ROOT / "state.json"
@@ -44,8 +45,10 @@ OS_RELEASE = Path("/etc/os-release")
 ANSI = {
     "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
     "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
-    "blue": "\033[94m", "magenta": "\033[95m", "cyan": "\033[96m",
+    "blue": "\033[96m", "magenta": "\033[2m", "cyan": "\033[96m",
     "white": "\033[97m",
+    "badge_green": "\033[42m\033[30m", "badge_yellow": "\033[43m\033[30m",
+    "badge_red": "\033[41m\033[97m",
 }
 
 COMMAND_ALIASES = {
@@ -75,19 +78,47 @@ def utf8_output():
 
 def symbol(name):
     unicode_symbols = {
-        "heavy": "━", "light": "─", "ok": "✓", "warn": "⚠",
-        "error": "✗", "info": "·", "idle": "○", "pending": "◷",
+        "heavy": "─", "light": "─", "ok": "✓", "warn": "!",
+        "error": "✗", "info": "›", "idle": "!", "pending": "!",
     }
     ascii_symbols = {
-        "heavy": "=", "light": "-", "ok": "[OK]", "warn": "[!]",
-        "error": "[X]", "info": "[ ]", "idle": "[ ]", "pending": "[~]",
+        "heavy": "-", "light": "-", "ok": "[OK]", "warn": "!",
+        "error": "[ERR]", "info": ">", "idle": "!", "pending": "!",
     }
-    return (unicode_symbols if utf8_output() else ascii_symbols)[name]
+    return (unicode_symbols if decorated() else ascii_symbols)[name]
+
+
+def decorated():
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ and utf8_output()
+
+
+def vislen(text):
+    return len(re.sub(r'\x1b\[[0-9;]*m', '', str(text)))
+
+
+def pad_left(text, width):
+    return " " * max(0, width - vislen(text)) + str(text)
+
+
+def pad_right(text, width):
+    return str(text) + " " * max(0, width - vislen(text))
+
+
+def clip(text, width):
+    text = re.sub(r'\x1b\[[0-9;]*m', '', str(text))
+    if vislen(text) <= width:
+        return text
+    ending = "…" if decorated() else "~"
+    return text[:max(0, width - 1)] + ending if width else ""
+
+
+def term_width():
+    return max(1, min(shutil.get_terminal_size((80, 24)).columns, WIDTH))
 
 
 def terminal_width():
     """Fit the interface to the current terminal without exceeding 100 columns."""
-    return max(20, min(shutil.get_terminal_size((80, 24)).columns, 100))
+    return term_width()
 
 
 def rule(char=None, width=None, style="cyan"):
@@ -106,7 +137,7 @@ def message(kind, text, *styles, file=None):
     lines = textwrap.wrap(str(text), width=available, replace_whitespace=False,
                           drop_whitespace=True) or [""]
     for index, line in enumerate(lines):
-        rendered = (prefix if index == 0 else " " * len(prefix)) + line
+        rendered = (prefix if index == 0 else "  ") + line
         print(colored(rendered, colors[kind], *styles), file=file)
 
 
@@ -138,19 +169,33 @@ def print_fit(text, *styles, indent=2):
         print(" " * indent + colored(line, *styles))
 
 
+def field(label, value):
+    prefix = "  " + pad_right(label, 25) + " : "
+    if vislen(prefix + str(value)) <= terminal_width():
+        print(prefix + str(value))
+    else:
+        print_fit(label + ":", "dim")
+        print_fit(re.sub(r'\x1b\[[0-9;]*m', '', str(value)))
+
+
 def menu_line(key, label, style="white"):
-    token = f"[{key}]".ljust(5)
+    style = "red" if key == "10" else "white"
+    token = f"[{pad_left(key, 2)}] "
     prefix = "  " + token
     available = max(1, terminal_width() - len(prefix))
     lines = textwrap.wrap(label, width=available) or [""]
     print("  " + colored(token, "bold", style) + colored(lines[0], style))
     for line in lines[1:]:
-        print(" " * len(prefix) + colored(line, style))
+        print("  " + colored(line, style))
 
 
 def menu_section(label):
     print()
-    print(colored("  " + label.upper(), "magenta", "bold"))
+    print_fit(label, "dim")
+
+
+def badge(label, style):
+    return colored(" " + pad_right(label, vislen("ТРЕБУЕТ ВОССТАНОВЛЕНИЯ")) + " ", "badge_" + style)
 
 
 def status_mark(ok, good="РАБОТАЕТ", bad="НЕ РАБОТАЕТ"):
@@ -160,15 +205,15 @@ def status_mark(ok, good="РАБОТАЕТ", bad="НЕ РАБОТАЕТ"):
 
 def menu_status():
     if not STATE.exists():
-        return colored("НЕ УСТАНОВЛЕН", "yellow", "bold")
+        return badge("НЕ УСТАНОВЛЕН", "yellow")
     if (ROOT / "pending").exists():
-        return colored("ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ", "yellow", "bold")
+        return badge("ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ", "yellow")
     if (ROOT / "enabled").exists():
         try:
-            return colored("АКТИВЕН", "green", "bold") if present() else colored("ТРЕБУЕТ ВОССТАНОВЛЕНИЯ", "red", "bold")
+            return badge("АКТИВЕН", "green") if present() else badge("ТРЕБУЕТ ВОССТАНОВЛЕНИЯ", "red")
         except (OSError, subprocess.SubprocessError, ValueError):
-            return colored("СТАТУС НЕДОСТУПЕН", "red", "bold")
-    return colored("ВЫКЛЮЧЕН", "yellow", "bold")
+            return badge("СТАТУС НЕДОСТУПЕН", "red")
+    return badge("ВЫКЛЮЧЕН", "yellow")
 
 
 def run(*args, data=None, check=True, timeout=60):
@@ -343,7 +388,7 @@ def lookup(ip):
     return lookup_many([ip])[ip]
 
 
-def top(resolve=True):
+def top(resolve=True, limit=10):
     journal = run("journalctl", "-k", "--since", "24 hours ago", "--grep=CBTC[46] ",
                   "-n", "10000", "-o", "json", "--no-pager",
                   check=False, timeout=300)
@@ -352,10 +397,10 @@ def top(resolve=True):
         raise subprocess.CalledProcessError(journal.returncode, journal.args,
                                             journal.stdout, journal.stderr)
     text = journal.stdout
-    rows = journal_top(text)
+    rows = journal_top(text)[:limit]
     labels = lookup_many([ip for ip, _ in rows]) if resolve and rows else {}
     width = terminal_width()
-    ip_w = max([len(ip) for ip, _ in rows] + [15])
+    ip_w = min(21, max([len(ip) for ip, _ in rows] + [15]))
     # On very narrow consoles, preserve the table within the available width.
     ip_w = min(ip_w, max(15, width - 25))
     org_w = max(8, width - 19 - ip_w)
@@ -363,31 +408,35 @@ def top(resolve=True):
         org_w = max(1, width - 17 - ip_w)
     print()
     rule("─", width, "blue")
-    print_fit("ТОП-10 ЗАБЛОКИРОВАННЫХ IP", "blue", "bold")
+    print_fit(f"ТОП-{limit} ЗАБЛОКИРОВАННЫХ IP", "cyan", "bold")
     print_fit("Период: 24 часа · анализ: до 10 000 записей журнала", "dim")
     print_fit("Это записи блокировок, а не число сканирований или атак.", "yellow")
     if resolve and rows:
         print_fit("Организация: внешний RDAP · кэш 7 дней", "magenta")
     print()
+    if not rows:
+        empty = "Блокировок за 24 часа пока нет"
+        if vislen(empty) <= width - 2:
+            print("  " + colored(empty.center(width - 2), "dim"))
+        else:
+            print_fit(empty, "dim")
+        return
     if width < 33:
         print_fit("№  IP / пакеты", "cyan", "bold")
         for index, (ip, count) in enumerate(rows, 1):
             print_fit(f"{index}. {ip} / {count}", "white")
-            print_fit((labels[ip] if resolve else "—"), "magenta", indent=4)
+            print_fit((labels[ip] if resolve else "-"), "dim")
     else:
-        heading = f"  {'№':<3} {'IP':<{ip_w}} {'Пакетов':>8}  {'Организация / сеть':<{org_w}}"
-        print(colored(heading[:width], "cyan", "bold"))
+        org_w = width - 17 - ip_w
+        heading = "  " + pad_left("№", 2) + "  " + pad_right("IP", ip_w) + " " + pad_left("Пакетов", 8) + "  " + clip("Организация", org_w)
+        print(colored(heading, "dim"))
+        rule("─", width, "dim")
         for index, (ip, count) in enumerate(rows, 1):
-            label = labels[ip] if resolve else "—"
-            label = safe_label(label)[:org_w]
-            shown_ip = ip[:ip_w]
-            print(f"  {colored(f'{index:<3}', 'dim')} {colored(f'{shown_ip:<{ip_w}}', 'white')} "
-                  f"{colored(f'{count:>8}', 'yellow')}  {colored(f'{label:<{org_w}}', 'magenta')}")
-    if not rows:
-        info("За последние 24 часа заблокированных обращений пока нет.")
-    else:
-        info("Владелец сети не обязательно отправитель или хостер.")
-    rule("─", width, "blue")
+            label = clip(safe_label(labels[ip]) if resolve else "-", org_w)
+            count_text = f"{count:,}".replace(",", "\u00a0" if decorated() else " ")
+            print("  " + pad_left(index, 2) + "  " + pad_right(clip(ip, ip_w), ip_w) + " "
+                  + pad_left(count_text, 8) + "  " + label)
+    print_fit("Владелец сети не обязательно отправитель или хостер", "dim")
 
 
 def journal_output(*args):
@@ -621,26 +670,26 @@ def component_report(state):
     rule("─", style="blue")
     print(colored("  ОТЧЁТ О РАБОТЕ КОМПОНЕНТОВ", "blue", "bold"))
     print()
-    print(f"  Фильтрация входящего трафика : {filtering}")
+    field("Фильтрация", filtering)
     if table:
         table_status = status_mark(True, "ЗАГРУЖЕНА")
     elif enabled or pending:
         table_status = status_mark(False, bad="ОТСУТСТВУЕТ")
     else:
         table_status = colored(symbol("idle") + " не загружена — фильтрация выключена", "yellow")
-    print(f"  Таблица nftables          : {table_status}")
+    field("Таблица nftables", table_status)
     if enabled:
         startup = status_mark(service_enabled, "ВКЛЮЧЕНО", "ВЫКЛЮЧЕНО")
         updates = status_mark(timer_active, "АКТИВНО", "НЕАКТИВНО")
     else:
         startup = colored(symbol("idle") + " включится после подтверждения фильтрации", "yellow")
         updates = colored(symbol("idle") + " включится после подтверждения фильтрации", "yellow")
-    print(f"  Восстановление при старте : {startup}")
-    print(f"  Ежедневное обновление     : {updates}")
-    print(f"  Внешние списки            : {sum(len(x) for x in state['lists'].values())} сетей/адресов")
-    print(f"  Исключения                : {len(state['allow'])}")
-    print(f"  Журналирование блокировок : {'ВКЛЮЧЕНО' if state.get('logging') else 'ВЫКЛЮЧЕНО'}")
-    print(f"  Последнее обновление      : {format_updated(state.get('updated'))}")
+    field("Восстановление при старте", startup)
+    field("Ежедневное обновление", updates)
+    field("Внешние списки", f"{sum(len(x) for x in state['lists'].values())} сетей/адресов")
+    field("Исключения", len(state['allow']))
+    field("Журналирование блокировок", 'ВКЛЮЧЕНО' if state.get('logging') else 'ВЫКЛЮЧЕНО')
+    field("Последнее обновление", format_updated(state.get('updated')))
     rule("─", style="blue")
 
 
@@ -670,13 +719,22 @@ def ask_yes(label):
 
 def brand_header():
     print()
-    rule()
-    print_fit("ЧебурNET · TRAFFIC CONTROL", "cyan", "bold")
-    print_fit("УПРАВЛЕНИЕ ФИЛЬТРАЦИЕЙ ВХОДЯЩЕГО ТРАФИКА", "magenta", "bold")
-    print_fit("Тестовая версия · " + VERSION, "yellow")
-    print_fit("Автор и разработчик: Леонид Копысов", "white")
-    print_fit("GitHub: leonidkopysov · Telegram: @kopysovleonid", "dim")
-    rule()
+    width = terminal_width()
+    if width < 8:
+        print_fit("ЧебурNET", "cyan")
+        return
+    left, right, bottom_left, bottom_right, side = ("╭", "╮", "╰", "╯", "│") if decorated() else ("+", "+", "+", "+", "|")
+    inside = width - 4
+    print(colored(left + symbol("light") * (width - 2) + right, "cyan"))
+    for value, styles in [
+        ("ЧебурNET · TRAFFIC CONTROL", ("cyan", "bold")),
+        (VERSION + " · ТЕСТОВАЯ ВЕРСИЯ", ("dim",)),
+        ("Леонид Копысов · Telegram: @kopysovleonid", ("dim",)),
+        ("GitHub: leonidkopysov", ("dim",)),
+    ]:
+        for line in textwrap.wrap(value, width=inside):
+            print(colored(side, "cyan") + " " + pad_right(colored(line, *styles), inside) + " " + colored(side, "cyan"))
+    print(colored(bottom_left + symbol("light") * (width - 2) + bottom_right, "cyan"))
 
 
 def confirm_install_start(confirmed=False):
@@ -979,16 +1037,16 @@ def print_status(state):
     rule("─", style="blue")
     print(colored("  СОСТОЯНИЕ", "blue", "bold"))
     print()
-    print(f"  Версия                    : {VERSION}")
-    print(f"  Таблица nftables           : {'создана' if present() else 'отсутствует'}")
-    print(f"  Фильтрация              : {'включена' if (ROOT / 'enabled').exists() else 'выключена'}")
-    print(f"  Подтверждение             : {'ожидается' if (ROOT / 'pending').exists() else 'не требуется'}")
-    print(f"  Списки обновлены        : {format_updated(state.get('updated'))}")
+    field("Версия", VERSION)
+    field("Таблица nftables", 'создана' if present() else 'отсутствует')
+    field("Фильтрация", 'включена' if (ROOT / 'enabled').exists() else 'выключена')
+    field("Подтверждение", 'ожидается' if (ROOT / 'pending').exists() else 'не требуется')
+    field("Списки обновлены", format_updated(state.get('updated')))
     for name, entries in state["lists"].items():
-        print(f"    {name:<22} {len(entries):>7} записей")
-    print(f"  Порты SSH                 : {', '.join(map(str, state['ssh_ports']))}")
-    print(f"  Исключения                : {', '.join(state['allow'])}")
-    print(f"  Ручные блокировки        : {', '.join(state['manual']) or '—'}")
+        field(name, f"{len(entries)} записей")
+    field("Порты SSH", ', '.join(map(str, state['ssh_ports'])))
+    field("Исключения", ', '.join(state['allow']))
+    field("Ручные блокировки", ', '.join(state['manual']) or '-')
     print()
     info("Полные правила: cheburnet-traffic-control rules")
     rule("─", style="blue")
@@ -1105,10 +1163,16 @@ def execute(args):
 
 def menu():
     while True:
-        if sys.stdout.isatty():
+        height = shutil.get_terminal_size((80, 24)).lines
+        if decorated() and height >= 30:
             print("\033[2J\033[H", end="")
         brand_header()
         installed = STATE.exists()
+        status = menu_status()
+        if terminal_width() >= 40:
+            print("  " + pad_right("Состояние", 14) + status)
+        else:
+            print_fit("Состояние: " + re.sub(r'\x1b\[[0-9;]*m', '', status).strip(), "dim")
         if installed:
             try:
                 state = load()
@@ -1124,27 +1188,26 @@ def menu():
         if not installed:
             menu_line("1", "Установить компонент (фильтрация останется выключенной)", "green")
         else:
-            menu_section("Состояние и списки")
+            menu_section("Просмотр")
             menu_line("1", "Показать краткое состояние", "blue")
             menu_line("2", "Обновить три внешних списка", "blue")
             menu_line("11", "Самодиагностика и исправление", "magenta")
             menu_line("12", "Показать полные правила nftables", "blue")
             menu_line("13", "Показать последние журналы", "blue")
-            menu_section("Блокировки и исключения")
+            menu_section("Списки")
             menu_line("3", "Добавить ручной бан IP или CIDR", "yellow")
             menu_line("4", "Снять точный ручной бан", "green")
             menu_line("5", "Добавить IP в исключения", "green")
             menu_line("6", "Удалить IP из исключений", "yellow")
-            menu_section("Включение и подтверждение")
+            menu_section("Управление")
             menu_line("7", "Пробно включить фильтрацию на 120 секунд", "yellow")
             menu_line("8", "Подтвердить пробное включение", "green")
             menu_line("9", "Выключить фильтрацию", "yellow")
-            menu_section("Удаление")
             menu_line("10", "Удаление программы и служб", "red")
         menu_line("0", "Выход", "white")
         if installed:
             try:
-                top()
+                top(limit=5 if height < 30 else 10)
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 print()
                 err("Топ-10 временно недоступен: " + safe_label(exc))

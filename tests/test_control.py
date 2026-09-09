@@ -13,6 +13,50 @@ spec.loader.exec_module(c)
 
 
 class ControlTests(unittest.TestCase):
+    def test_visible_padding_ignores_ansi(self):
+        value = '\033[92mТест\033[0m'
+        self.assertEqual(c.vislen(value), 4)
+        self.assertEqual(c.vislen(c.pad_left(value, 10)), 10)
+        self.assertEqual(c.vislen(c.pad_right(value, 10)), 10)
+        self.assertEqual(c.vislen(c.clip(value, 3)), 3)
+
+    def test_header_borders_align_with_and_without_color(self):
+        class Terminal(io.StringIO):
+            encoding = 'utf-8'
+            def isatty(self):
+                return True
+        for width in (20, 40, 53, 78, 120):
+            for no_color in (True, False):
+                output = Terminal()
+                with patch('sys.stdout', output), \
+                     patch.dict(c.os.environ, {'NO_COLOR': '1'} if no_color else {}, clear=True), \
+                     patch.object(c.shutil, 'get_terminal_size', return_value=c.os.terminal_size((width, 24))):
+                    c.brand_header()
+                    self.assertTrue(all(c.vislen(line) == min(width, 78)
+                                        for line in output.getvalue().splitlines() if line))
+                if no_color:
+                    self.assertNotIn('\033', output.getvalue())
+                    self.assertNotIn('│', output.getvalue())
+                else:
+                    self.assertIn('╭', output.getvalue())
+
+    def test_badges_have_equal_width(self):
+        sizes = [c.vislen(c.badge(label, 'yellow')) for label in
+                 ('АКТИВЕН', 'НЕ УСТАНОВЛЕН', 'ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ', 'ТРЕБУЕТ ВОССТАНОВЛЕНИЯ')]
+        self.assertEqual(len(set(sizes)), 1)
+
+    def test_low_menu_limits_top_and_never_clears_no_color(self):
+        output = io.StringIO()
+        with patch('sys.stdout', output), patch.dict(c.os.environ, {'NO_COLOR': '1'}), \
+             patch.object(c, 'STATE') as state, patch.object(c, 'menu_status', return_value='АКТИВЕН'), \
+             patch.object(c, 'load', return_value=self.state()), patch.object(c, 'component_report'), \
+             patch.object(c, 'top') as top, patch('builtins.input', return_value='0'), \
+             patch.object(c.shutil, 'get_terminal_size', return_value=c.os.terminal_size((53, 24))):
+            state.exists.return_value = True
+            c.menu()
+        top.assert_called_once_with(limit=5)
+        self.assertNotIn('\033', output.getvalue())
+
     def state(self):
         return dict(ssh_ports=[22222], allow=["198.51.100.9", "2001:db8::1"],
                     lists={"test": ["198.51.100.0/24", "2001:db8::/32"]}, manual=[],
@@ -111,7 +155,8 @@ class ControlTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(c, 'run', return_value=result), patch('sys.stdout', output):
             c.top(resolve=False)
-        self.assertIn('заблокированных обращений пока нет', output.getvalue())
+        self.assertIn('Блокировок за 24 часа пока нет', output.getvalue())
+        self.assertNotIn('Пакетов', output.getvalue())
         self.assertNotIn('Владелец сети', output.getvalue())
 
     def test_top_table_fits_terminal_width(self):
@@ -120,7 +165,7 @@ class ControlTests(unittest.TestCase):
         for width in (20, 32, 60, 80, 100, 120):
             with self.subTest(width=width):
                 output = io.StringIO()
-                expected = min(width, 100)
+                expected = min(width, 78)
                 with patch.object(c, 'run', return_value=result), \
                      patch.object(c, 'lookup_many', return_value={"2001:db8:1234:5678::1234": "X" * 200}), \
                      patch.object(c.shutil, 'get_terminal_size', return_value=c.os.terminal_size((width, 24))), \
@@ -130,7 +175,7 @@ class ControlTests(unittest.TestCase):
                 self.assertTrue(all(len(line) <= expected for line in lines))
                 self.assertEqual(len(lines[1]), expected)
                 if width >= 60:
-                    self.assertIn('Организация / сеть', output.getvalue())
+                    self.assertIn('Организация', output.getvalue())
 
     def test_ascii_symbols_for_non_utf8_stdout(self):
         class AsciiOutput(io.StringIO):
@@ -141,7 +186,7 @@ class ControlTests(unittest.TestCase):
             c.ok('готово')
             c.rule()
         self.assertIn('[OK] готово', output.getvalue())
-        self.assertIn('=' * c.terminal_width(), output.getvalue())
+        self.assertIn('-' * c.terminal_width(), output.getvalue())
 
     def test_log_report_accepts_empty_journals(self):
         output = io.StringIO()
@@ -219,8 +264,8 @@ class ControlTests(unittest.TestCase):
             state.exists.return_value = False
             c.menu()
         text = output.getvalue()
-        self.assertIn('Тестовая версия', text)
-        self.assertIn('[1]  Установить компонент', text)
+        self.assertIn('ТЕСТОВАЯ ВЕРСИЯ', text)
+        self.assertIn('[ 1] Установить компонент', text)
         self.assertNotIn('[10]  Удалить компонент', text)
         self.assertNotIn('\033[', text)
 
@@ -229,16 +274,17 @@ class ControlTests(unittest.TestCase):
         with patch.object(c.sys.stdout, 'isatty', return_value=False), patch.object(c, 'STATE') as state, \
              patch.object(c, 'load', return_value=self.state()), \
              patch.object(c, 'component_report', side_effect=lambda value: print('ОТЧЁТ КОМПОНЕНТОВ')), \
-             patch.object(c, 'top', side_effect=lambda: print('ТОП-10 ПРОВЕРКА')), \
+             patch.object(c, 'top', side_effect=lambda **kwargs: print('ТОП-10 ПРОВЕРКА')), \
              patch('builtins.input', return_value='0'), patch('sys.stdout', output):
             state.exists.return_value = True
             c.menu()
         text = output.getvalue()
-        self.assertIn('[1]  Показать краткое состояние', text)
+        self.assertIn('[ 1] Показать краткое состояние', text)
         self.assertIn('[10] Удаление программы', text)
         self.assertIn('[11] Самодиагностика', text)
-        self.assertIn('СОСТОЯНИЕ И СПИСКИ', text)
-        self.assertIn('БЛОКИРОВКИ И ИСКЛЮЧЕНИЯ', text)
+        self.assertIn('Просмотр', text)
+        self.assertIn('Списки', text)
+        self.assertIn('Управление', text)
         self.assertLess(text.index('ГЛАВНОЕ МЕНЮ'), text.index('ТОП-10 ПРОВЕРКА'))
 
     def test_short_command_aliases(self):
