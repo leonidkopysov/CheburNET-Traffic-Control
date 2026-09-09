@@ -20,7 +20,7 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = "0.1.0-alpha.3"
+VERSION = "0.1.0-alpha.4"
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")
 STATE = ROOT / "state.json"
@@ -32,6 +32,8 @@ SOURCES = {name: BASE + name + ".list" for name in
            ("antiscanner", "government_networks", "skipa")}
 MAX_BYTES = 8 * 1024 * 1024
 MAX_ENTRIES = 150000
+CA_CERT = Path("/etc/ssl/certs/ca-certificates.crt")
+OS_RELEASE = Path("/etc/os-release")
 
 ANSI = {
     "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
@@ -72,6 +74,61 @@ def menu_status():
 def run(*args, data=None, check=True):
     return subprocess.run(args, input=data, text=True, capture_output=True,
                           check=check, timeout=60)
+
+
+def os_release(path=OS_RELEASE):
+    values = {}
+    try:
+        for line in path.read_text().splitlines():
+            if "=" not in line or line.lstrip().startswith("#"):
+                continue
+            key, value = line.split("=", 1)
+            values[key] = value.strip().strip('"\'')
+    except OSError:
+        pass
+    return values
+
+
+def missing_packages():
+    packages = []
+    if not shutil.which("nft"):
+        packages.append("nftables")
+    if not CA_CERT.is_file() or CA_CERT.stat().st_size == 0:
+        packages.append("ca-certificates")
+    return packages
+
+
+def apt_install(packages):
+    info = os_release()
+    family = " ".join((info.get("ID", ""), info.get("ID_LIKE", ""))).lower().split()
+    if not set(family) & {"debian", "ubuntu"} or not shutil.which("apt-get"):
+        raise ValueError("Автоустановка пакетов поддерживается только в Ubuntu и Debian с apt-get.")
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    print(colored("  ◷ Обновляю индекс пакетов…", "blue"))
+    subprocess.run(["apt-get", "update"], check=True, timeout=600, env=env)
+    print(colored("  ◷ Устанавливаю: " + ", ".join(packages), "blue"))
+    subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", *packages],
+                   check=True, timeout=900, env=env)
+
+
+def ensure_dependencies(auto_install=False):
+    if sys.version_info < (3, 10):
+        raise ValueError("Требуется Python 3.10 или новее.")
+    packages = missing_packages()
+    if packages and not auto_install:
+        raise ValueError("Не установлены пакеты: " + ", ".join(packages) + ".")
+    if packages:
+        print(colored("  Найдены отсутствующие пакеты: " + ", ".join(packages), "yellow"))
+        apt_install(packages)
+    remaining = missing_packages()
+    if remaining:
+        raise ValueError("После установки не найдены: " + ", ".join(remaining) + ".")
+    if not shutil.which("systemctl") or not shutil.which("journalctl"):
+        raise ValueError("Не найдены systemctl/journalctl; требуется systemd.")
+    if not Path("/run/systemd/system").is_dir():
+        raise ValueError("systemd установлен, но не работает как система инициализации.")
+    print(colored("  ✓ Зависимости проверены.", "green"))
 
 
 def networks(text):
@@ -625,8 +682,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
         parser.error("Запуск только от root.")
-    if not shutil.which("nft") or not Path("/run/systemd/system").is_dir():
-        parser.error("Нужны nftables, Python 3.10+ и работающий systemd. Пакеты автоматически не устанавливаются.")
+    try:
+        ensure_dependencies(auto_install=args.command == "install")
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        parser.error(str(exc))
     os.umask(0o077)
     if args.command == "top":
         # Slow external RDAP queries must never delay the activation rollback lock.
