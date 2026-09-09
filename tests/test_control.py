@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import io
 from argparse import Namespace
 from unittest.mock import patch
 
@@ -138,6 +139,29 @@ class ControlTests(unittest.TestCase):
                 stat.return_value.st_mode = 0o100600
                 stat.return_value.st_size = 100
                 self.assertEqual(c.panel_hint(path), '1.1.1.1 8.8.8.8')
+
+    def test_color_disabled_for_pipe(self):
+        with patch.object(c.sys.stdout, 'isatty', return_value=False):
+            self.assertEqual(c.colored('Тест', 'red', 'bold'), 'Тест')
+
+    def test_no_color_environment(self):
+        with patch.object(c.sys.stdout, 'isatty', return_value=True), patch.dict(c.os.environ, {'NO_COLOR': '1'}):
+            self.assertEqual(c.colored('Тест', 'green'), 'Тест')
+
+    def test_color_enabled_for_terminal(self):
+        with patch.object(c.sys.stdout, 'isatty', return_value=True), patch.dict(c.os.environ, {}, clear=True):
+            self.assertIn('\033[92m', c.colored('Тест', 'green'))
+
+    def test_vertical_menu(self):
+        output = io.StringIO()
+        with patch.object(c.sys.stdout, 'isatty', return_value=False), patch.object(c, 'STATE') as state, patch('builtins.input', return_value='0'), patch('sys.stdout', output):
+            state.exists.return_value = False
+            c.menu()
+        text = output.getvalue()
+        self.assertIn('ТЕСТОВАЯ ВЕРСИЯ', text)
+        self.assertIn('[ 1]  Показать состояние', text)
+        self.assertIn('[10]  Удалить компонент', text)
+        self.assertNotIn('\033[', text)
 
 
 if __name__ == "__main__":
