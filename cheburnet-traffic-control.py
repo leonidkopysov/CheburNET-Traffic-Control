@@ -13,13 +13,14 @@ import os
 import re
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
 
-VERSION = "0.1.0-alpha.1"
+VERSION = "0.1.0-alpha.2"
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")
 STATE = ROOT / "state.json"
@@ -289,6 +290,99 @@ AccuracySec=1s
 """}
 
 
+def port_list(value):
+    ports = sorted(set(int(x) for x in value.replace(',', ' ').split()))
+    if not ports or any(p < 1 or p > 65535 for p in ports):
+        raise ValueError("Порты должны быть числами от 1 до 65535.")
+    return ports
+
+
+def ip_list(value):
+    values = sorted(set(host(x) for x in value.replace(',', ' ').split()))
+    if not values:
+        raise ValueError("Укажите хотя бы один IP.")
+    return values
+
+
+def ask_yes(label):
+    while True:
+        answer = input(label + " [Д/Н]: ").strip().lower()
+        if answer in ("д", "да", "y", "yes"):
+            return True
+        if answer in ("н", "нет", "n", "no"):
+            return False
+        print("Введите Д или Н.")
+
+
+def ask_value(label, candidate, validator):
+    if candidate:
+        print(label + ": " + candidate)
+        if ask_yes("Верно?"):
+            return validator(candidate)
+    while True:
+        try:
+            return validator(input(label + " (введите своё значение): ").strip())
+        except (ValueError, OSError):
+            print("Некорректное значение. Повторите ввод.")
+
+
+def panel_hint(path=Path('/opt/remnanode/settings.json')):
+    # Extract only the validated field; never display or modify the settings file.
+    try:
+        if path.is_symlink():
+            return ""
+        st = path.stat()
+        if st.st_uid != 0 or st.st_mode & 0o022 or st.st_size > 65536:
+            return ""
+        values = json.loads(path.read_text()).get('panel_ips', '')
+        return " ".join(ip_list(values)) if isinstance(values, str) else ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def panel_input(value):
+    try:
+        return ip_list(value)
+    except ValueError:
+        # Domain only: not a URL, port, CIDR, shell command or list of hostnames.
+        if not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?', value):
+            raise ValueError('Укажите IP или домен без https:// и пути.')
+        print('DNS домена может указывать на CDN, а не исходящий IP панели!')
+        addresses = sorted(set(host(item[4][0]) for item in socket.getaddrinfo(
+            value, None, type=socket.SOCK_STREAM)))
+        print('Найдены адреса: ' + ', '.join(addresses))
+        if not addresses or not ask_yes('Это именно исходящие IP панели?'):
+            raise ValueError('Введите исходящий IP панели вручную.')
+        return addresses
+
+
+def install_inputs(args):
+    # Explicit flags remain suitable for unattended installs; never append rejected hints.
+    if args.ssh_port or args.allow:
+        if not args.ssh_port or not args.allow:
+            raise ValueError('Укажите оба параметра --ssh-port и --allow либо запустите install без них.')
+        return port_list(' '.join(map(str, args.ssh_port))), ip_list(' '.join(args.allow))
+    if not sys.stdin.isatty():
+        raise ValueError('Для подтверждений нужен терминал. Либо задайте --ssh-port и --allow.')
+    connection = os.environ.get('SSH_CONNECTION', '').split()
+    admin, port = '', ''
+    if len(connection) == 4:
+        try:
+            admin = host(connection[0])
+            port = str(port_list(connection[3])[0])
+        except ValueError:
+            admin, port = '', ''
+    print('IP SSH-клиента может принадлежать VPN, NAT или промежуточному серверу.')
+    admins = ask_value('IP администратора', admin, ip_list)
+    ports = ask_value('Порт SSH', port, port_list)
+    panel = ask_value('Исходящие IP панели (или её домен для поиска)', panel_hint(), panel_input)
+    allowed = sorted(set(admins + panel))
+    print('Итог: SSH ' + ', '.join(map(str, ports)) + '; исключения IP: ' + ', '.join(allowed))
+    if not ask_yes('Установить с этими настройками?'):
+        raise ValueError('Установка отменена. Настройки не записаны.')
+    return ports, allowed
+
+
 def install(args):
     if STATE.exists() or BIN.exists() or present():
         raise ValueError("Установка или таблица уже существует. Автоперезапись запрещена.")
@@ -296,16 +390,7 @@ def install(args):
         raise ValueError("Конфликт имён systemd. Ничего не перезаписано.")
     if shutil.which("traffic-guard") or Path("/opt/trafficguard-manager.sh").exists():
         raise ValueError("Обнаружен TrafficGuard. Сначала удалите его штатно на тестовом сервере.")
-    ports = args.ssh_port or []
-    allow = [host(x) for x in args.allow]
-    connection = os.environ.get("SSH_CONNECTION", "").split()
-    if len(connection) == 4:
-        ports.append(int(connection[3]))
-        allow.append(host(connection[0]))
-    if not ports:
-        raise ValueError("Укажите --ssh-port с реальным портом SSH.")
-    if not allow:
-        raise ValueError("Укажите --allow с IP администратора и IP панели.")
+    ports, allow = install_inputs(args)
     state = dict(schema=1, ssh_ports=ports, allow=sorted(set(allow)), manual=[],
                  lists=fetch_lists(), updated=int(time.time()), logging=args.logging)
     run("nft", "-c", "-f", "-", data=render(state))
