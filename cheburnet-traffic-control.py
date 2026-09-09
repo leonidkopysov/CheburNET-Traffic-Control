@@ -20,7 +20,7 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = "0.1.0-alpha.2"
+VERSION = "0.1.0-alpha.3"
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")
 STATE = ROOT / "state.json"
@@ -32,6 +32,41 @@ SOURCES = {name: BASE + name + ".list" for name in
            ("antiscanner", "government_networks", "skipa")}
 MAX_BYTES = 8 * 1024 * 1024
 MAX_ENTRIES = 150000
+
+ANSI = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
+    "blue": "\033[94m", "magenta": "\033[95m", "cyan": "\033[96m",
+    "white": "\033[97m",
+}
+
+
+def colored(text, *styles):
+    """Use ANSI only in an interactive terminal; logs and pipes stay clean."""
+    if not sys.stdout.isatty() or "NO_COLOR" in os.environ:
+        return str(text)
+    return "".join(ANSI[x] for x in styles) + str(text) + ANSI["reset"]
+
+
+def rule(char="━", width=62, style="cyan"):
+    print(colored(char * width, style))
+
+
+def menu_line(key, label, style="white"):
+    print("  " + colored(f"[{key:>2}]", "bold", style) + "  " + colored(label, style))
+
+
+def menu_status():
+    if not STATE.exists():
+        return colored("НЕ УСТАНОВЛЕН", "yellow", "bold")
+    if (ROOT / "pending").exists():
+        return colored("ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ", "yellow", "bold")
+    if (ROOT / "enabled").exists():
+        try:
+            return colored("АКТИВЕН", "green", "bold") if present() else colored("ТРЕБУЕТ ВОССТАНОВЛЕНИЯ", "red", "bold")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return colored("СТАТУС НЕДОСТУПЕН", "red", "bold")
+    return colored("ВЫКЛЮЧЕН", "yellow", "bold")
 
 
 def run(*args, data=None, check=True):
@@ -138,17 +173,22 @@ def top(resolve=True):
     text = run("journalctl", "-k", "--since", "24 hours ago", "--grep=CBTC[46] ",
                "-n", "10000", "-o", "json", "--no-pager").stdout
     rows = journal_top(text)
-    print("\nТОП-10 IP · последние 24 часа · до 10 000 записей журнала")
-    print("Зарегистрированные блокировки, НЕ число сканирований или атак.")
+    print()
+    rule("─", style="blue")
+    print(colored("  ТОП-10 ЗАБЛОКИРОВАННЫХ IP", "blue", "bold"))
+    print(colored("  Период: 24 часа · анализ: до 10 000 записей журнала", "dim"))
+    print(colored("  Это записи блокировок, а не число сканирований или атак.", "yellow"))
     if resolve and rows:
-        print("Организация: данные внешнего RDAP (IP передаются rdap.org/реестру), кэш 7 дней.")
-    print(f"{'№':<3} {'IP':<40} {'Записей':>8}  Организация / имя сети")
+        print(colored("  Организация: внешний RDAP · кэш 7 дней", "magenta"))
+    print()
+    print(colored(f"  {'№':<3} {'IP':<39} {'Пакетов':>8}  Организация / сеть", "cyan", "bold"))
     for index, (ip, count) in enumerate(rows, 1):
         label = lookup(ip) if resolve else "Расшифровка отключена"
-        print(f"{index:<3} {ip:<40} {count:>8}  {label}")
+        print(f"  {index:<3} {colored(f'{ip:<39}', 'white')} {colored(f'{count:>8}', 'yellow')}  {colored(label, 'magenta')}")
     if not rows:
-        print("Пока нет записей. Нужны включённое логирование и новые блокировки.")
-    print("Логи ограничены по частоте. Владелец сети не обязательно отправитель или хостер.")
+        print(colored("  Пока нет записей: нужны логирование и новые блокировки.", "dim"))
+    print(colored("  Владелец сети не обязательно отправитель или хостер.", "dim"))
+    rule("─", style="blue")
 
 
 def fetch_lists():
@@ -506,39 +546,59 @@ def execute(args):
 
 def menu():
     while True:
-        print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        print("  ЧебурNET · TRAFFIC CONTROL " + VERSION)
-        print("  Автор: Леонид Копысов · @kopysovleonid")
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        if sys.stdout.isatty():
+            print("\033[2J\033[H", end="")
+        print()
+        rule()
+        print(colored("  ЧебурNET · TRAFFIC CONTROL", "cyan", "bold"))
+        print(colored("  ТЕСТОВАЯ ВЕРСИЯ · " + VERSION, "magenta", "bold"))
+        print(colored("  Автор и разработчик: Леонид Копысов", "white"))
+        print(colored("  Telegram: @kopysovleonid", "dim"))
+        print("  Состояние: " + menu_status())
+        rule()
         if STATE.exists():
             try:
                 main(["top"])
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
-                print("Топ недоступен: " + safe_label(exc))
-        print("\n1 — Статус   2 — Обновить списки   3 — Бан   4 — Снять ручной бан")
-        print("5 — Исключение IP   6 — Пробное включение   7 — Подтвердить")
-        print("8 — Выключить   9 — Удалить   0 — Выход")
-        choice = input("Выберите действие: ").strip()
+                print(colored("  Топ недоступен: " + safe_label(exc), "red"))
+        print()
+        print(colored("  ГЛАВНОЕ МЕНЮ", "cyan", "bold"))
+        print()
+        menu_line("1", "Показать состояние и правила", "blue")
+        menu_line("2", "Обновить три внешних списка", "blue")
+        menu_line("3", "Добавить ручной бан IP или CIDR", "yellow")
+        menu_line("4", "Снять точный ручной бан", "green")
+        menu_line("5", "Добавить IP в исключения", "green")
+        menu_line("6", "Удалить IP из исключений", "yellow")
+        menu_line("7", "Пробно включить защиту на 120 секунд", "yellow")
+        menu_line("8", "Подтвердить пробное включение", "green")
+        menu_line("9", "Выключить защиту", "yellow")
+        menu_line("10", "Удалить компонент", "red")
+        menu_line("0", "Выход", "white")
+        print()
+        rule("─", style="cyan")
+        choice = input(colored("  Выберите действие: ", "cyan", "bold")).strip()
         if choice == "0":
             return
-        command = {"1": "status", "2": "update", "3": "ban", "4": "unban", "5": "allow",
-                   "6": "activate", "7": "confirm", "8": "disable", "9": "uninstall"}.get(choice)
+        command = {"1": "status", "2": "update", "3": "ban", "4": "unban",
+                   "5": "allow", "6": "disallow", "7": "activate", "8": "confirm",
+                   "9": "disable", "10": "uninstall"}.get(choice)
         if not command:
             continue
         args = [command]
-        if command in ("ban", "unban", "allow"):
-            args.append(input("IP (для ручного бана также CIDR): ").strip())
+        if command in ("ban", "unban", "allow", "disallow"):
+            args.append(input(colored("  IP (для ручного бана также CIDR): ", "cyan")).strip())
         if command == "uninstall":
-            if input("Удалить программу? Введите Д: ").strip().lower() != "д":
+            if input(colored("  Удалить компонент? Введите Д: ", "red", "bold")).strip().lower() != "д":
                 continue
             args.append("--yes")
         try:
             main(args)
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
-            print("✗ " + str(exc))
+            print(colored("  ✗ " + str(exc), "red", "bold"))
         if command == "uninstall":
             return
-        input("Enter — вернуться в меню: ")
+        input(colored("  Enter — вернуться в меню: ", "dim"))
 
 
 def main(argv=None):
