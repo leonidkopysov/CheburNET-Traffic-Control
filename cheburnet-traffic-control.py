@@ -24,7 +24,7 @@ import textwrap
 import time
 import urllib.request
 
-VERSION = "0.1.0-alpha.9"
+VERSION = "1.0.0"
 WIDTH = 78
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")
@@ -207,7 +207,7 @@ def menu_status():
     if not STATE.exists():
         return badge("НЕ УСТАНОВЛЕН", "yellow")
     if (ROOT / "pending").exists():
-        return badge("ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ", "yellow")
+        return badge("ВКЛЮЧЕНИЕ НЕ ЗАВЕРШЕНО", "yellow")
     if (ROOT / "enabled").exists():
         try:
             return badge("АКТИВЕН", "green") if present() else badge("ТРЕБУЕТ ВОССТАНОВЛЕНИЯ", "red")
@@ -620,7 +620,7 @@ RandomizedDelaySec=30min
 WantedBy=timers.target
 """,
         UNIT + "-rollback.service": f"""[Unit]
-Description=ЧебурNET Traffic Control: откат неподтверждённого включения
+Description=ЧебурNET Traffic Control: откат незавершённого включения
 [Service]
 Type=oneshot
 ExecStart={BIN} rollback
@@ -659,7 +659,7 @@ def component_report(state):
     service_enabled = unit_state("is-enabled", UNIT + ".service") == "enabled"
     timer_active = unit_state("is-active", UNIT + "-update.timer") == "active"
     if pending:
-        filtering = colored(symbol("pending") + " ПРОБНОЕ ВКЛЮЧЕНИЕ", "yellow", "bold")
+        filtering = colored(symbol("pending") + " ВКЛЮЧЕНИЕ НЕ ЗАВЕРШЕНО", "yellow", "bold")
     elif enabled and table:
         filtering = colored(symbol("ok") + " АКТИВНА", "green", "bold")
     elif enabled:
@@ -682,8 +682,8 @@ def component_report(state):
         startup = status_mark(service_enabled, "ВКЛЮЧЕНО", "ВЫКЛЮЧЕНО")
         updates = status_mark(timer_active, "АКТИВНО", "НЕАКТИВНО")
     else:
-        startup = colored(symbol("idle") + " включится после подтверждения фильтрации", "yellow")
-        updates = colored(symbol("idle") + " включится после подтверждения фильтрации", "yellow")
+        startup = colored(symbol("idle") + " включится вместе с фильтрацией", "yellow")
+        updates = colored(symbol("idle") + " включится вместе с фильтрацией", "yellow")
     field("Восстановление при старте", startup)
     field("Ежедневное обновление", updates)
     field("Внешние списки", f"{sum(len(x) for x in state['lists'].values())} сетей/адресов")
@@ -728,7 +728,7 @@ def brand_header():
     print(colored(left + symbol("light") * (width - 2) + right, "cyan"))
     for value, styles in [
         ("ЧебурNET · TRAFFIC CONTROL", ("cyan", "bold")),
-        (VERSION + " · ТЕСТОВАЯ ВЕРСИЯ", ("dim",)),
+        ("Версия " + VERSION, ("dim",)),
         ("Леонид Копысов · Telegram: @kopysovleonid", ("dim",)),
         ("GitHub: leonidkopysov", ("dim",)),
     ]:
@@ -747,7 +747,7 @@ def confirm_install_start(confirmed=False):
     print()
     print("  Скрипт проверит зависимости, загрузит три внешних списка,")
     print("  сохранит конфигурацию и установит службы восстановления.")
-    warn("Фильтрация не включится до отдельной пробной активации.")
+    info("После установки выберите «Включить фильтрацию» в меню.")
     warn("Держите доступ к консоли VPS до завершения проверки.")
     print()
     if not ask_yes("  Продолжить установку?"):
@@ -831,7 +831,7 @@ def install(args):
     if any((SYSTEMD / name).exists() for name in service_files()):
         raise ValueError("Конфликт имён systemd. Ничего не перезаписано.")
     if shutil.which("traffic-guard") or Path("/opt/trafficguard-manager.sh").exists():
-        raise ValueError("Обнаружен TrafficGuard. Сначала удалите его штатно на тестовом сервере.")
+        raise ValueError("Обнаружен TrafficGuard. Сначала удалите его штатным способом.")
     ports, allow = install_inputs(args)
     state = dict(schema=1, ssh_ports=ports, allow=sorted(set(allow)), manual=[],
                  lists=fetch_lists(), updated=int(time.time()), logging=args.logging)
@@ -862,21 +862,41 @@ def install(args):
                 pass
         raise
     ok("Компонент установлен, конфигурация сохранена.")
-    info("Фильтрация пока выключена. Для проверки выберите пробное включение в меню.")
+    info("Фильтрация пока выключена. Выберите «Включить фильтрацию» в меню или выполните ctc on.")
 
 
 def activate():
     state = load()
     if (ROOT / "enabled").exists() or (ROOT / "pending").exists():
-        raise ValueError("Фильтрация уже включена или ожидает подтверждения. "
+        raise ValueError("Фильтрация уже включена или предыдущая операция не завершена. "
                          "Выполните cheburnet-traffic-control status.")
     atomic(ROOT / "pending", str(time.time()))
-    run("systemctl", "restart", UNIT + "-rollback.timer")
-    apply(state)
-    pending("Фильтрация пробно включена на 120 секунд.")
-    info("Проверьте новое SSH-подключение, панель и VPN.")
-    ok("Если всё работает, выполните cheburnet-traffic-control confirm.")
-    warn("Без подтверждения правила будут автоматически удалены.")
+    try:
+        # The timer is only a crash-recovery guard; no user confirmation step.
+        run("systemctl", "restart", UNIT + "-rollback.timer")
+        apply(state)
+        finish_activation()
+    except BaseException:
+        # Keep the guard armed if cleanup itself fails.
+        disable()
+        run("systemctl", "stop", UNIT + "-rollback.timer", check=False)
+        raise
+    ok("Фильтрация включена. Автовосстановление и обновление списков включены.")
+
+
+def finish_activation():
+    """Commit activation while holding the shared lock, including old installations."""
+    if not present():
+        raise ValueError("Таблица фильтрации отсутствует; включение не завершено.")
+    atomic(ROOT / "enabled", "1\n")
+    try:
+        run("systemctl", "enable", UNIT + ".service")
+        run("systemctl", "enable", "--now", UNIT + "-update.timer")
+    except BaseException:
+        (ROOT / "enabled").unlink(missing_ok=True)
+        raise
+    (ROOT / "pending").unlink(missing_ok=True)
+    run("systemctl", "stop", UNIT + "-rollback.timer", check=False)
 
 
 def disable(units=True):
@@ -962,7 +982,7 @@ def diagnostic_items(state):
     except (OSError, ValueError, subprocess.SubprocessError):
         table = False
     if pending:
-        add("Пробное включение", table and unit_state("is-active", UNIT + "-rollback.timer") == "active",
+        add("Незавершённое включение", table and unit_state("is-active", UNIT + "-rollback.timer") == "active",
             "таймер отката активен")
     elif enabled:
         add("Рабочая таблица", table, "загружена" if table else "отсутствует")
@@ -999,8 +1019,7 @@ def print_diagnostics(state):
 
 def repair(state, confirmed=False):
     if (ROOT / "pending").exists():
-        raise ValueError("Сначала выполните cheburnet-traffic-control confirm либо "
-                         "cheburnet-traffic-control disable.")
+        raise ValueError("Предыдущее включение не завершено. Выполните ctc off и повторите исправление.")
     if not confirmed:
         if not sys.stdin.isatty():
             raise ValueError("Для автоматического восстановления добавьте --yes.")
@@ -1040,7 +1059,7 @@ def print_status(state):
     field("Версия", VERSION)
     field("Таблица nftables", 'создана' if present() else 'отсутствует')
     field("Фильтрация", 'включена' if (ROOT / 'enabled').exists() else 'выключена')
-    field("Подтверждение", 'ожидается' if (ROOT / 'pending').exists() else 'не требуется')
+    field("Операция включения", 'не завершена' if (ROOT / 'pending').exists() else 'нет незавершённых операций')
     field("Списки обновлены", format_updated(state.get('updated')))
     for name, entries in state["lists"].items():
         field(name, f"{len(entries)} записей")
@@ -1094,18 +1113,10 @@ def execute(args):
     elif cmd == "confirm":
         pending = ROOT / "pending"
         if not pending.exists() or time.time() - float(pending.read_text(encoding="utf-8")) >= 120 or not present():
-            raise ValueError("Нет действующего пробного включения; выполните "
+            raise ValueError("Нет незавершённого включения; выполните "
                              "cheburnet-traffic-control activate снова.")
-        atomic(ROOT / "enabled", "1\n")
-        try:
-            run("systemctl", "enable", UNIT + ".service")
-            run("systemctl", "enable", "--now", UNIT + "-update.timer")
-        except BaseException:
-            (ROOT / "enabled").unlink(missing_ok=True)
-            raise
-        pending.unlink()
-        run("systemctl", "stop", UNIT + "-rollback.timer")
-        ok("Фильтрация подтверждена: восстановление и обновление включены.")
+        finish_activation()
+        ok("Включение завершено: восстановление и обновление включены.")
     elif cmd == "rollback":
         if (ROOT / "pending").exists():
             disable()
@@ -1131,8 +1142,7 @@ def execute(args):
         info("Конфигурация сохранена в " + str(ROOT))
     elif cmd in ("update", "ban", "unban", "allow", "disallow"):
         if (ROOT / "pending").exists():
-            raise ValueError("Сначала выполните cheburnet-traffic-control confirm либо "
-                             "cheburnet-traffic-control disable.")
+            raise ValueError("Предыдущее включение не завершено. Выполните ctc off, затем ctc on.")
         old = json.loads(json.dumps(state))
         if cmd == "update":
             state["lists"] = fetch_lists()
@@ -1200,8 +1210,7 @@ def menu():
             menu_line("5", "Добавить IP в исключения", "green")
             menu_line("6", "Удалить IP из исключений", "yellow")
             menu_section("Управление")
-            menu_line("7", "Пробно включить фильтрацию на 120 секунд", "yellow")
-            menu_line("8", "Подтвердить пробное включение", "green")
+            menu_line("7", "Включить фильтрацию", "white")
             menu_line("9", "Выключить фильтрацию", "yellow")
             menu_line("10", "Удаление программы и служб", "red")
         menu_line("0", "Выход", "white")
@@ -1218,7 +1227,7 @@ def menu():
             return
         command = ("install" if not installed and choice == "1" else
                    {"1": "status", "2": "update", "3": "ban", "4": "unban",
-                    "5": "allow", "6": "disallow", "7": "activate", "8": "confirm",
+                    "5": "allow", "6": "disallow", "7": "activate",
                     "9": "disable", "10": "uninstall", "11": "check",
                     "12": "rules", "13": "logs"}.get(choice) if installed else None)
         if not command:
@@ -1297,7 +1306,7 @@ def main(argv=None):
     parser = RussianArgumentParser(
         prog="cheburnet-traffic-control",
         usage="%(prog)s [--version] КОМАНДА [ПАРАМЕТРЫ]",
-        description="ЧебурNET Traffic Control — управление фильтрацией входящего трафика. Тестовая версия.")
+        description="ЧебурNET Traffic Control — управление фильтрацией входящего трафика.")
     parser.add_argument("--version", action="version", version=VERSION,
                         help="показать номер версии и выйти")
     subs = parser.add_subparsers(dest="command", required=True, title="команды", metavar="КОМАНДА")
@@ -1323,12 +1332,14 @@ def main(argv=None):
     command_help = {
         "rules": "показать полные правила nftables", "logs": "показать последние журналы",
         "check": "выполнить самодиагностику",
-        "activate": "пробно включить фильтрацию", "confirm": "подтвердить пробное включение",
+        "activate": "включить фильтрацию, автовосстановление и обновление списков",
         "disable": "выключить фильтрацию", "restore": "восстановить правила из локальной копии",
         "rollback": "выполнить аварийный откат", "update": "обновить три внешних списка",
     }
     for cmd, help_text in command_help.items():
         subs.add_parser(cmd, prog=parser.prog + " " + cmd, usage="%(prog)s", help=help_text)
+    # Accept the legacy command without advertising a separate confirmation step.
+    subs.add_parser("confirm", prog=parser.prog + " confirm", usage="%(prog)s")
     repair_parser = subs.add_parser("repair", prog=parser.prog + " repair", usage="%(prog)s [--yes]",
                                     help="исправить обнаруженные проблемы")
     repair_parser.add_argument("--yes", action="store_true",

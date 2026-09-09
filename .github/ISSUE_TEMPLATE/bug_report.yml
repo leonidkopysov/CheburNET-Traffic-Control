@@ -1,0 +1,27 @@
+name: Сообщение об ошибке
+description: Ошибка установки, работы или оформления Traffic Control
+title: "[Ошибка] "
+body:
+  - type: markdown
+    attributes:
+      value: "Уберите секреты и непубличные адреса из вывода. Об уязвимостях сообщайте лично по SECURITY.md."
+  - type: input
+    id: version
+    attributes:
+      label: Версия программы и ОС
+      placeholder: "ctc --version; Ubuntu/Debian; версия Python"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Действия и ожидаемый результат
+      description: Какая команда выполнена и что произошло?
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Диагностика
+      description: Только относящийся к проблеме вывод без секретов
+      render: text

@@ -264,7 +264,8 @@ class ControlTests(unittest.TestCase):
             state.exists.return_value = False
             c.menu()
         text = output.getvalue()
-        self.assertIn('ТЕСТОВАЯ ВЕРСИЯ', text)
+        self.assertIn('Версия 1.0.0', text)
+        self.assertNotIn('ТЕСТОВАЯ ВЕРСИЯ', text)
         self.assertIn('[ 1] Установить компонент', text)
         self.assertNotIn('[10]  Удалить компонент', text)
         self.assertNotIn('\033[', text)
@@ -285,6 +286,9 @@ class ControlTests(unittest.TestCase):
         self.assertIn('Просмотр', text)
         self.assertIn('Списки', text)
         self.assertIn('Управление', text)
+        self.assertIn('Включить фильтрацию', text)
+        self.assertNotIn('Пробно', text)
+        self.assertNotIn('Подтвердить пробное', text)
         self.assertLess(text.index('ГЛАВНОЕ МЕНЮ'), text.index('ТОП-10 ПРОВЕРКА'))
 
     def test_short_command_aliases(self):
@@ -373,9 +377,78 @@ class ControlTests(unittest.TestCase):
         self.assertIn('использование:', text)
         self.assertIn('параметры:', text)
         for command in ('install', 'top', 'status', 'rules', 'logs', 'check', 'activate',
-                        'confirm', 'disable', 'restore', 'rollback', 'update', 'repair',
+                        'disable', 'restore', 'rollback', 'update', 'repair',
                         'ban', 'unban', 'allow', 'disallow', 'uninstall'):
             self.assertIn(command, text)
+        self.assertNotIn('confirm', text)
+
+    def test_activation_commits_without_user_confirmation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), \
+                 patch.object(c, 'apply') as apply, patch.object(c, 'present', return_value=True), \
+                 patch.object(c, 'run') as run, patch('builtins.input') as user_input:
+                c.activate()
+                self.assertTrue((root / 'enabled').exists())
+                self.assertFalse((root / 'pending').exists())
+                apply.assert_called_once()
+                user_input.assert_not_called()
+                calls = [call.args for call in run.call_args_list]
+                self.assertIn(('systemctl', 'enable', c.UNIT + '.service'), calls)
+                self.assertIn(('systemctl', 'enable', '--now', c.UNIT + '-update.timer'), calls)
+                self.assertNotIn(('systemctl', 'enable', '--now', c.UNIT + '.service'), calls)
+                self.assertEqual(calls[-1], ('systemctl', 'stop', c.UNIT + '-rollback.timer'))
+
+    def test_activation_failures_clean_up_and_allow_retry(self):
+        for failure in ('apply', 'service', 'timer', 'marker'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                real_atomic = c.atomic
+
+                def fake_run(*args, **kwargs):
+                    if failure == 'service' and args == ('systemctl', 'enable', c.UNIT + '.service'):
+                        raise OSError('activation failed')
+                    if failure == 'timer' and args == ('systemctl', 'enable', '--now', c.UNIT + '-update.timer'):
+                        raise OSError('activation failed')
+
+                def fake_atomic(path, text, mode=0o600):
+                    if failure == 'marker' and path.name == 'enabled':
+                        raise OSError('activation failed')
+                    return real_atomic(path, text, mode)
+
+                with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), \
+                     patch.object(c, 'apply', side_effect=OSError('activation failed') if failure == 'apply' else None), \
+                     patch.object(c, 'present', return_value=True), patch.object(c, 'remove_table') as remove, \
+                     patch.object(c, 'run', side_effect=fake_run), patch.object(c, 'atomic', side_effect=fake_atomic):
+                    with self.assertRaisesRegex(OSError, 'activation failed'):
+                        c.activate()
+                    self.assertFalse((root / 'pending').exists())
+                    self.assertFalse((root / 'enabled').exists())
+                    remove.assert_called_once()
+                with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), \
+                     patch.object(c, 'apply'), patch.object(c, 'present', return_value=True), patch.object(c, 'run'):
+                    c.activate()
+                    self.assertTrue((root / 'enabled').exists())
+
+    def test_queued_rollback_after_success_does_not_disable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'enabled').touch()
+            with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), \
+                 patch.object(c, 'disable') as disable:
+                c.execute(Namespace(command='rollback'))
+                disable.assert_not_called()
+
+    def test_repeated_activation_leaves_existing_filter_alone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'enabled').touch()
+            with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), \
+                 patch.object(c, 'apply') as apply, patch.object(c, 'run') as run:
+                with self.assertRaises(ValueError):
+                    c.activate()
+                apply.assert_not_called()
+                run.assert_not_called()
 
     def test_systemd_descriptions_are_russian(self):
         self.assertTrue(all('Description=ЧебурNET' in body for body in c.service_files().values()))
