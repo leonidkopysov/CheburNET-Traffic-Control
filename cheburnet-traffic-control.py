@@ -6,6 +6,7 @@ Copyright (c) 2026 Леонид Копысов. SPDX-License-Identifier: MIT
 """
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import ipaddress
 import json
@@ -20,7 +21,7 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = "0.1.0-alpha.4"
+VERSION = "0.1.0-alpha.5"
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")
 STATE = ROOT / "state.json"
@@ -71,15 +72,15 @@ def menu_status():
     return colored("ВЫКЛЮЧЕН", "yellow", "bold")
 
 
-def run(*args, data=None, check=True):
+def run(*args, data=None, check=True, timeout=60):
     return subprocess.run(args, input=data, text=True, capture_output=True,
-                          check=check, timeout=60)
+                          check=check, timeout=timeout)
 
 
 def os_release(path=OS_RELEASE):
     values = {}
     try:
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             if "=" not in line or line.lstrip().startswith("#"):
                 continue
             key, value = line.split("=", 1)
@@ -200,36 +201,54 @@ def rdap_label(data):
     return " / ".join(dict.fromkeys(names))[:100] or network
 
 
-def lookup(ip):
-    path = ROOT / "rdap-cache.json"
-    try:
-        cache = json.loads(path.read_text())
-    except (OSError, ValueError):
-        cache = {}
-    entry = cache.get(ip)
-    if entry and time.time() - entry["time"] < 7 * 86400:
-        return entry["label"]
+def rdap_lookup(ip):
+    """Resolve one address without touching the shared cache."""
     try:
         opener = urllib.request.build_opener(HTTPSOnly())
         with opener.open("https://rdap.org/ip/" + host(ip), timeout=3) as response:
             raw = response.read(512 * 1024 + 1)
         if len(raw) > 512 * 1024:
             raise ValueError("RDAP response too large")
-        label = rdap_label(json.loads(raw))
+        return rdap_label(json.loads(raw))
     except (OSError, ValueError, TypeError, AttributeError):
         return "Не определено (RDAP недоступен)"
-    cache = {k: v for k, v in cache.items() if time.time() - v["time"] < 7 * 86400}
+
+
+def lookup_many(addresses):
+    """Resolve cold RDAP entries concurrently and update the cache once."""
+    path = ROOT / "rdap-cache.json"
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    now = time.time()
+    cache = {k: v for k, v in cache.items()
+             if isinstance(v, dict) and now - v.get("time", 0) < 7 * 86400}
+    result = {ip: cache[ip]["label"] for ip in addresses
+              if ip in cache and isinstance(cache[ip].get("label"), str)}
+    missing = [ip for ip in addresses if ip not in result]
+    if missing:
+        with ThreadPoolExecutor(max_workers=min(10, len(missing))) as pool:
+            labels = list(pool.map(rdap_lookup, missing))
+        for ip, label in zip(missing, labels):
+            result[ip] = label
+            if not label.startswith("Не определено"):
+                cache[ip] = dict(time=now, label=label)
     if len(cache) >= 1000:
-        cache.pop(next(iter(cache)))
-    cache[ip] = dict(time=time.time(), label=label)
+        cache = dict(sorted(cache.items(), key=lambda item: item[1]["time"], reverse=True)[:999])
     atomic(path, json.dumps(cache, ensure_ascii=False))
-    return label
+    return result
+
+
+def lookup(ip):
+    return lookup_many([ip])[ip]
 
 
 def top(resolve=True):
     text = run("journalctl", "-k", "--since", "24 hours ago", "--grep=CBTC[46] ",
-               "-n", "10000", "-o", "json", "--no-pager").stdout
+               "-n", "10000", "-o", "json", "--no-pager", timeout=300).stdout
     rows = journal_top(text)
+    labels = lookup_many([ip for ip, _ in rows]) if resolve and rows else {}
     print()
     rule("─", style="blue")
     print(colored("  ТОП-10 ЗАБЛОКИРОВАННЫХ IP", "blue", "bold"))
@@ -240,7 +259,7 @@ def top(resolve=True):
     print()
     print(colored(f"  {'№':<3} {'IP':<39} {'Пакетов':>8}  Организация / сеть", "cyan", "bold"))
     for index, (ip, count) in enumerate(rows, 1):
-        label = lookup(ip) if resolve else "Расшифровка отключена"
+        label = labels[ip] if resolve else "Расшифровка отключена"
         print(f"  {index:<3} {colored(f'{ip:<39}', 'white')} {colored(f'{count:>8}', 'yellow')}  {colored(label, 'magenta')}")
     if not rows:
         print(colored("  Пока нет записей: нужны логирование и новые блокировки.", "dim"))
@@ -256,7 +275,7 @@ def fetch_lists():
 def atomic(path, text, mode=0o600):
     fd, temp = tempfile.mkstemp(prefix=".new-", dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), mode)
             stream.write(text)
             stream.flush()
@@ -272,7 +291,7 @@ def save(state):
 
 
 def load():
-    state = json.loads(STATE.read_text())
+    state = json.loads(STATE.read_text(encoding="utf-8"))
     if state.get("schema") != 1:
         raise ValueError("Неизвестная версия конфигурации.")
     return state
@@ -321,8 +340,8 @@ def present():
 
 def apply(state):
     rules = render(state, present())
-    run("nft", "-c", "-f", "-", data=rules)
-    run("nft", "-f", "-", data=rules)
+    run("nft", "-c", "-f", "-", data=rules, timeout=300)
+    run("nft", "-f", "-", data=rules, timeout=300)
 
 
 def remove_table():
@@ -424,14 +443,14 @@ def ask_value(label, candidate, validator):
 
 
 def panel_hint(path=Path('/opt/remnanode/settings.json')):
-    # Extract only the validated field; never display or modify the settings file.
+    # CheburNET Vision writes this non-secret field; never read node.env/.env secrets.
     try:
         if path.is_symlink():
             return ""
         st = path.stat()
         if st.st_uid != 0 or st.st_mode & 0o022 or st.st_size > 65536:
             return ""
-        values = json.loads(path.read_text()).get('panel_ips', '')
+        values = json.loads(path.read_text(encoding="utf-8")).get('panel_ips', '')
         return " ".join(ip_list(values)) if isinstance(values, str) else ""
     except (OSError, ValueError, AttributeError):
         return ""
@@ -490,13 +509,31 @@ def install(args):
     ports, allow = install_inputs(args)
     state = dict(schema=1, ssh_ports=ports, allow=sorted(set(allow)), manual=[],
                  lists=fetch_lists(), updated=int(time.time()), logging=args.logging)
-    run("nft", "-c", "-f", "-", data=render(state))
+    run("nft", "-c", "-f", "-", data=render(state), timeout=300)
+    root_created = not ROOT.exists()
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-    save(state)
-    atomic(BIN, Path(__file__).read_text(), 0o755)
-    for name, body in service_files().items():
-        atomic(SYSTEMD / name, body, 0o644)
-    run("systemctl", "daemon-reload")
+    try:
+        save(state)
+        atomic(BIN, Path(__file__).read_text(encoding="utf-8"), 0o755)
+        for name, body in service_files().items():
+            atomic(SYSTEMD / name, body, 0o644)
+        run("systemctl", "daemon-reload")
+    except BaseException:
+        for path in [*(SYSTEMD / name for name in service_files()), BIN, STATE]:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            run("systemctl", "daemon-reload", check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if root_created:
+            try:
+                ROOT.rmdir()
+            except OSError:
+                pass
+        raise
     print("✓ Установлено. Фильтрация ещё выключена. Выполните: cheburnet-traffic-control activate")
 
 
@@ -511,12 +548,13 @@ def activate():
     print("Затем: cheburnet-traffic-control confirm. Без подтверждения фильтрация отключится.")
 
 
-def disable():
+def disable(units=True):
     (ROOT / "enabled").unlink(missing_ok=True)
     remove_table()
     (ROOT / "pending").unlink(missing_ok=True)
-    run("systemctl", "disable", "--now", UNIT + "-update.timer", check=False)
-    run("systemctl", "disable", UNIT + ".service", check=False)
+    if units:
+        run("systemctl", "disable", "--now", UNIT + "-update.timer", check=False)
+        run("systemctl", "disable", UNIT + ".service", check=False)
     print("○ Собственная фильтрация выключена; остальные правила не изменены.")
 
 
@@ -540,7 +578,7 @@ def execute(args):
         activate()
     elif cmd == "confirm":
         pending = ROOT / "pending"
-        if not pending.exists() or time.time() - float(pending.read_text()) >= 120 or not present():
+        if not pending.exists() or time.time() - float(pending.read_text(encoding="utf-8")) >= 120 or not present():
             raise ValueError("Нет действующего пробного включения; выполните activate снова.")
         atomic(ROOT / "enabled", "1\n")
         try:
@@ -557,7 +595,7 @@ def execute(args):
             disable()
     elif cmd == "restore":
         if (ROOT / "pending").exists():
-            disable()
+            disable(units=False)
         elif (ROOT / "enabled").exists():
             apply(state)
     elif cmd == "disable":
@@ -613,7 +651,8 @@ def menu():
         print(colored("  Telegram: @kopysovleonid", "dim"))
         print("  Состояние: " + menu_status())
         rule()
-        if STATE.exists():
+        installed = STATE.exists()
+        if installed:
             try:
                 main(["top"])
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -621,25 +660,29 @@ def menu():
         print()
         print(colored("  ГЛАВНОЕ МЕНЮ", "cyan", "bold"))
         print()
-        menu_line("1", "Показать состояние и правила", "blue")
-        menu_line("2", "Обновить три внешних списка", "blue")
-        menu_line("3", "Добавить ручной бан IP или CIDR", "yellow")
-        menu_line("4", "Снять точный ручной бан", "green")
-        menu_line("5", "Добавить IP в исключения", "green")
-        menu_line("6", "Удалить IP из исключений", "yellow")
-        menu_line("7", "Пробно включить защиту на 120 секунд", "yellow")
-        menu_line("8", "Подтвердить пробное включение", "green")
-        menu_line("9", "Выключить защиту", "yellow")
-        menu_line("10", "Удалить компонент", "red")
+        if not installed:
+            menu_line("1", "Установить компонент (защита останется выключенной)", "green")
+        else:
+            menu_line("1", "Показать состояние и правила", "blue")
+            menu_line("2", "Обновить три внешних списка", "blue")
+            menu_line("3", "Добавить ручной бан IP или CIDR", "yellow")
+            menu_line("4", "Снять точный ручной бан", "green")
+            menu_line("5", "Добавить IP в исключения", "green")
+            menu_line("6", "Удалить IP из исключений", "yellow")
+            menu_line("7", "Пробно включить защиту на 120 секунд", "yellow")
+            menu_line("8", "Подтвердить пробное включение", "green")
+            menu_line("9", "Выключить защиту", "yellow")
+            menu_line("10", "Удалить компонент", "red")
         menu_line("0", "Выход", "white")
         print()
         rule("─", style="cyan")
         choice = input(colored("  Выберите действие: ", "cyan", "bold")).strip()
         if choice == "0":
             return
-        command = {"1": "status", "2": "update", "3": "ban", "4": "unban",
-                   "5": "allow", "6": "disallow", "7": "activate", "8": "confirm",
-                   "9": "disable", "10": "uninstall"}.get(choice)
+        command = ("install" if not installed and choice == "1" else
+                   {"1": "status", "2": "update", "3": "ban", "4": "unban",
+                    "5": "allow", "6": "disallow", "7": "activate", "8": "confirm",
+                    "9": "disable", "10": "uninstall"}.get(choice) if installed else None)
         if not command:
             continue
         args = [command]
@@ -663,6 +706,8 @@ def main(argv=None):
     if not argv:
         if not sys.stdin.isatty():
             raise ValueError("Без терминала укажите команду, например --help.")
+        if os.geteuid() != 0:
+            raise ValueError("Запуск только от root.")
         menu()
         return
     parser = argparse.ArgumentParser(description="ЧебурNET Traffic Control — фильтрация входящих IP. Тестовая версия.")
@@ -671,8 +716,8 @@ def main(argv=None):
     inst = subs.add_parser("install", help="Установка БЕЗ включения фильтрации")
     inst.add_argument("--ssh-port", action="append", type=int)
     inst.add_argument("--allow", action="append", default=[])
-    inst.add_argument("--logging", action="store_true", default=True)
     inst.add_argument("--no-logging", action="store_false", dest="logging")
+    inst.set_defaults(logging=True)
     subs.add_parser("top").add_argument("--no-resolve", action="store_true")
     for cmd in ("status", "activate", "confirm", "disable", "restore", "rollback", "update"):
         subs.add_parser(cmd)
@@ -681,18 +726,18 @@ def main(argv=None):
     subs.add_parser("uninstall").add_argument("--yes", action="store_true")
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
-        parser.error("Запуск только от root.")
+        raise ValueError("Запуск только от root.")
     try:
         ensure_dependencies(auto_install=args.command == "install")
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
-        parser.error(str(exc))
+        raise ValueError(str(exc)) from exc
     os.umask(0o077)
     if args.command == "top":
         # Slow external RDAP queries must never delay the activation rollback lock.
         execute(args)
         return
     # Root-owned /run lock serializes timer, user changes, activation and rollback.
-    with open("/run/cheburnet-traffic-control.lock", "w") as lock:
+    with open("/run/cheburnet-traffic-control.lock", "w", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         execute(args)
 
@@ -700,6 +745,12 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        print("\n○ Операция прервана пользователем.", file=sys.stderr)
+        sys.exit(130)
+    except EOFError:
+        print("\n✗ Ввод завершён до окончания операции.", file=sys.stderr)
+        sys.exit(1)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         print("✗ " + str(exc), file=sys.stderr)
         if isinstance(exc, subprocess.CalledProcessError):
