@@ -24,7 +24,7 @@ import textwrap
 import time
 import urllib.request
 
-VERSION = "0.1.0-alpha.7"
+VERSION = "0.1.0-alpha.8"
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")
 STATE = ROOT / "state.json"
@@ -924,10 +924,11 @@ def print_diagnostics(state):
     rule()
     print(colored("  САМОДИАГНОСТИКА ЧЕБУРNET", "cyan", "bold"))
     print()
-    for name, ok, detail in items:
-        mark = colored(symbol("ok"), "green", "bold") if ok else colored(symbol("error"), "red", "bold")
+    for name, item_ok, detail in items:
+        mark = (colored(symbol("ok"), "green", "bold") if item_ok else
+                colored(symbol("error"), "red", "bold"))
         print(f"  {mark} {name}: {detail}")
-    failed = sum(not ok for _, ok, _ in items)
+    failed = sum(not item_ok for _, item_ok, _ in items)
     print()
     if failed:
         err(f"Обнаружено проблем: {failed}. "

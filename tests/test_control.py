@@ -334,6 +334,13 @@ class ControlTests(unittest.TestCase):
     def test_systemd_descriptions_are_russian(self):
         self.assertTrue(all('Description=ЧебурNET' in body for body in c.service_files().values()))
 
+    def test_successful_diagnostics_prints_final_result(self):
+        output = io.StringIO()
+        with patch.object(c, 'diagnostic_items', return_value=[('Проверка', True, 'исправно')]), \
+             patch('sys.stdout', output):
+            self.assertEqual(c.print_diagnostics(self.state()), 0)
+        self.assertIn('Все проверяемые компоненты работают штатно', output.getvalue())
+
     def test_repair_refreshes_lists_and_creates_shortcut(self):
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder)
