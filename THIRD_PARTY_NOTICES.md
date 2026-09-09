@@ -15,5 +15,6 @@
 Списки не зеркалируются в этом репозитории. Их качество и состав контролируются внешними авторами.
 HTTPS защищает передачу, но не от ошибочного или скомпрометированного источника.
 
-Системные зависимости: Python, Linux Netfilter/nftables, systemd. Они устанавливаются отдельно
-и сохраняют собственные лицензии. Документация nftables: https://www.netfilter.org/projects/nftables/manpage.html
+Системные зависимости: Python, Linux Netfilter/nftables, systemd и CA-сертификаты. Недостающие пакеты
+`nftables` и `ca-certificates` установщик может поставить через apt; компоненты сохраняют собственные лицензии.
+Документация nftables: https://www.netfilter.org/projects/nftables/manpage.html
