@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from argparse import Namespace
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("control", Path(__file__).parents[1] / "cheburnet-traffic-control.py")
@@ -103,6 +104,40 @@ class ControlTests(unittest.TestCase):
     def test_rdap_owner(self):
         self.assertEqual(c.rdap_label({"entities": [{"roles": ["registrant"],
             "vcardArray": ["vcard", [["org", {}, "text", "Example Hosting"]]]}]}), "Example Hosting")
+
+    def test_interactive_accept(self):
+        with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.dict(c.os.environ, {'SSH_CONNECTION': '1.2.3.4 50000 5.6.7.8 2222'}), patch.object(c, 'panel_hint', return_value='9.8.7.6'), patch('builtins.input', side_effect=['д', 'д', 'д', 'д']):
+            self.assertEqual(c.install_inputs(Namespace(ssh_port=None, allow=[])), ([2222], ['1.2.3.4', '9.8.7.6']))
+
+    def test_rejected_hints_not_retained(self):
+        with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.dict(c.os.environ, {'SSH_CONNECTION': '1.2.3.4 50000 5.6.7.8 2222'}), patch.object(c, 'panel_hint', return_value='9.8.7.6'), patch('builtins.input', side_effect=['н', '8.8.8.8', 'н', '22', 'н', '1.1.1.1', 'д']):
+            self.assertEqual(c.install_inputs(Namespace(ssh_port=None, allow=[])), ([22], ['1.1.1.1', '8.8.8.8']))
+
+    def test_no_terminal(self):
+        with patch.object(c.sys.stdin, 'isatty', return_value=False), self.assertRaises(ValueError):
+            c.install_inputs(Namespace(ssh_port=None, allow=[]))
+
+    def test_explicit_flags_not_augmented(self):
+        with patch.dict(c.os.environ, {'SSH_CONNECTION': '9.9.9.9 123 5.5.5.5 5555'}):
+            self.assertEqual(c.install_inputs(Namespace(ssh_port=[22], allow=['1.1.1.1'])), ([22], ['1.1.1.1']))
+
+    def test_invalid_then_valid(self):
+        with patch('builtins.input', side_effect=['65536', '22']):
+            self.assertEqual(c.ask_value('SSH', '', c.port_list), [22])
+
+    def test_domain_requires_confirmation(self):
+        with patch.object(c.socket, 'getaddrinfo', return_value=[(2, 1, 6, '', ('1.2.3.4', 0))]), patch('builtins.input', return_value='н'), self.assertRaises(ValueError):
+            c.panel_input('panel.example.com')
+
+    def test_vision_field_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'settings.json'
+            c.atomic(path, json.dumps({'panel_ips': '1.1.1.1 8.8.8.8', 'secret': 'never-print'}))
+            with patch.object(Path, 'stat') as stat:
+                stat.return_value.st_uid = 0
+                stat.return_value.st_mode = 0o100600
+                stat.return_value.st_size = 100
+                self.assertEqual(c.panel_hint(path), '1.1.1.1 8.8.8.8')
 
 
 if __name__ == "__main__":
