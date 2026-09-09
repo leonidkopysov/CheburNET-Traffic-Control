@@ -105,6 +105,20 @@ class ControlTests(unittest.TestCase):
                   "OTHER SRC=5.6.7.8", "CBTC6 SRC=2001:db8::1 DST=::1", "CBTC4 SRC=999.1.1.1 ")]
         self.assertEqual(c.journal_top("\n".join(lines)), [("1.2.3.4", 2), ("2001:db8::1", 1)])
 
+    def test_top_accepts_empty_journal(self):
+        result = c.subprocess.CompletedProcess(('journalctl',), 1, '', '')
+        output = io.StringIO()
+        with patch.object(c, 'run', return_value=result), patch('sys.stdout', output):
+            c.top(resolve=False)
+        self.assertIn('заблокированных обращений пока нет', output.getvalue())
+
+    def test_log_report_accepts_empty_journals(self):
+        output = io.StringIO()
+        with patch.object(c, 'journal_output', return_value=''), patch('sys.stdout', output):
+            c.print_logs()
+        self.assertIn('За последние 24 часа записей нет', output.getvalue())
+        self.assertIn('За последние 7 дней записей нет', output.getvalue())
+
     def test_rdap_network_fallback(self):
         self.assertEqual(c.rdap_label({"name": "EXAMPLE-NET"}), "EXAMPLE-NET")
 
@@ -174,20 +188,38 @@ class ControlTests(unittest.TestCase):
             state.exists.return_value = False
             c.menu()
         text = output.getvalue()
-        self.assertIn('ТЕСТОВАЯ ВЕРСИЯ', text)
+        self.assertIn('Тестовая версия', text)
         self.assertIn('[ 1]  Установить компонент', text)
         self.assertNotIn('[10]  Удалить компонент', text)
         self.assertNotIn('\033[', text)
 
     def test_vertical_menu_after_install(self):
         output = io.StringIO()
-        with patch.object(c.sys.stdout, 'isatty', return_value=False), patch.object(c, 'STATE') as state, patch.object(c, 'menu_status', return_value='АКТИВЕН'), patch.object(c, 'main') as main, patch('builtins.input', return_value='0'), patch('sys.stdout', output):
+        with patch.object(c.sys.stdout, 'isatty', return_value=False), patch.object(c, 'STATE') as state, \
+             patch.object(c, 'load', return_value=self.state()), \
+             patch.object(c, 'component_report', side_effect=lambda value: print('ОТЧЁТ КОМПОНЕНТОВ')), \
+             patch.object(c, 'top', side_effect=lambda: print('ТОП-10 ПРОВЕРКА')), \
+             patch('builtins.input', return_value='0'), patch('sys.stdout', output):
             state.exists.return_value = True
             c.menu()
         text = output.getvalue()
-        self.assertIn('[ 1]  Показать состояние', text)
+        self.assertIn('[ 1]  Показать краткое состояние', text)
         self.assertIn('[10]  Удалить компонент', text)
-        main.assert_called_once_with(['top'])
+        self.assertIn('[11]  Самодиагностика', text)
+        self.assertLess(text.index('ГЛАВНОЕ МЕНЮ'), text.index('ТОП-10 ПРОВЕРКА'))
+
+    def test_short_command_aliases(self):
+        self.assertEqual(c.normalize_argv(['s']), ['status'])
+        self.assertEqual(c.normalize_argv(['on']), ['activate'])
+        self.assertEqual(c.normalize_argv(['fix', '--yes']), ['repair', '--yes'])
+        self.assertEqual(c.normalize_argv(['l']), ['logs'])
+
+    def test_install_confirmation_precedes_dependencies(self):
+        with patch.object(c.os, 'geteuid', return_value=0), \
+             patch.object(c, 'confirm_install_start', side_effect=ValueError('отмена')), \
+             patch.object(c, 'ensure_dependencies') as dependencies, self.assertRaisesRegex(ValueError, 'отмена'):
+            c.main(['install'])
+        dependencies.assert_not_called()
 
     def test_menu_requires_root_before_opening(self):
         with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.object(c.os, 'geteuid', return_value=1000), patch.object(c, 'menu') as menu, self.assertRaises(ValueError):
@@ -211,7 +243,7 @@ class ControlTests(unittest.TestCase):
             base = Path(folder)
             root, systemd = base / 'state', base / 'systemd'
             systemd.mkdir()
-            binary, state_file = base / 'bin', root / 'state.json'
+            binary, short, state_file = base / 'bin', base / 'ctc', root / 'state.json'
 
             def fake_run(*args, **kwargs):
                 if args == ('systemctl', 'daemon-reload') and kwargs.get('check', True):
@@ -219,15 +251,62 @@ class ControlTests(unittest.TestCase):
 
             lists = {'test': ['198.51.100.0/24']}
             with patch.object(c, 'ROOT', root), patch.object(c, 'STATE', state_file), \
-                 patch.object(c, 'BIN', binary), patch.object(c, 'SYSTEMD', systemd), \
+                 patch.object(c, 'BIN', binary), patch.object(c, 'SHORT_BIN', short), \
+                 patch.object(c, 'SYSTEMD', systemd), \
                  patch.object(c, 'present', return_value=False), \
                  patch.object(c, 'install_inputs', return_value=([22], ['198.51.100.9'])), \
                  patch.object(c, 'fetch_lists', return_value=lists), \
                  patch.object(c, 'run', side_effect=fake_run), self.assertRaises(OSError):
                 c.install(Namespace(logging=True))
             self.assertFalse(binary.exists())
+            self.assertFalse(short.exists())
             self.assertFalse(state_file.exists())
             self.assertFalse(any((systemd / name).exists() for name in c.service_files()))
+
+    def test_shortcut_points_to_main_binary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            binary, short = base / 'control', base / 'ctc'
+            binary.touch()
+            with patch.object(c, 'BIN', binary), patch.object(c, 'SHORT_BIN', short):
+                c.write_shortcut()
+                self.assertTrue(c.shortcut_valid())
+
+    def test_compact_status_does_not_dump_rules(self):
+        output = io.StringIO()
+        with patch.object(c, 'component_report'), patch('sys.stdout', output):
+            c.print_status(self.state())
+        text = output.getvalue()
+        self.assertIn('НАСТРОЙКИ', text)
+        self.assertIn('Полные правила: ctc r', text)
+        self.assertNotIn('table inet', text)
+
+    def test_systemd_descriptions_are_russian(self):
+        self.assertTrue(all('Description=ЧебурNET' in body for body in c.service_files().values()))
+
+    def test_repair_refreshes_lists_and_creates_shortcut(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            root, systemd = base / 'state', base / 'systemd'
+            root.mkdir()
+            systemd.mkdir()
+            state_file, binary, short = root / 'state.json', base / 'control', base / 'ctc'
+            state_file.write_text('{}', encoding='utf-8')
+            (root / 'enabled').touch()
+            state = dict(self.state(), lists={'test': ['198.51.100.0/24']}, updated=1, logging=True)
+            refreshed = {name: ['198.51.100.0/24'] for name in c.SOURCES}
+            with patch.object(c, 'ROOT', root), patch.object(c, 'STATE', state_file), \
+                 patch.object(c, 'BIN', binary), patch.object(c, 'SHORT_BIN', short), \
+                 patch.object(c, 'SYSTEMD', systemd), patch.object(c, 'fetch_lists', return_value=refreshed) as fetch, \
+                 patch.object(c, 'commit') as commit, patch.object(c, 'apply') as apply, \
+                 patch.object(c, 'run') as run, patch.object(c, 'print_diagnostics', return_value=0):
+                self.assertEqual(c.repair(state, confirmed=True), 0)
+                self.assertTrue(c.shortcut_valid())
+            fetch.assert_called_once_with()
+            commit.assert_called_once()
+            apply.assert_called_once()
+            self.assertIn(('systemctl', 'enable', c.UNIT + '.service'), [call.args for call in run.call_args_list])
+            self.assertNotIn(('systemctl', 'enable', '--now', c.UNIT + '.service'), [call.args for call in run.call_args_list])
 
     def test_os_release(self):
         with tempfile.TemporaryDirectory() as folder:

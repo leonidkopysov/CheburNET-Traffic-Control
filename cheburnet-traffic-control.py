@@ -7,6 +7,7 @@ Copyright (c) 2026 Леонид Копысов. SPDX-License-Identifier: MIT
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import fcntl
 import ipaddress
 import json
@@ -21,11 +22,12 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = "0.1.0-alpha.5"
+VERSION = "0.1.0-alpha.6"
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")
 STATE = ROOT / "state.json"
 BIN = Path("/usr/local/bin/cheburnet-traffic-control")
+SHORT_BIN = Path("/usr/local/bin/ctc")
 UNIT = "cheburnet-traffic-control"
 SYSTEMD = Path("/etc/systemd/system")
 BASE = "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/"
@@ -43,6 +45,12 @@ ANSI = {
     "white": "\033[97m",
 }
 
+COMMAND_ALIASES = {
+    "s": "status", "t": "top", "c": "check", "r": "rules",
+    "l": "logs", "u": "update", "on": "activate", "ok": "confirm",
+    "off": "disable", "fix": "repair",
+}
+
 
 def colored(text, *styles):
     """Use ANSI only in an interactive terminal; logs and pipes stay clean."""
@@ -57,6 +65,10 @@ def rule(char="━", width=62, style="cyan"):
 
 def menu_line(key, label, style="white"):
     print("  " + colored(f"[{key:>2}]", "bold", style) + "  " + colored(label, style))
+
+
+def status_mark(ok, good="РАБОТАЕТ", bad="НЕ РАБОТАЕТ"):
+    return colored("✓ " + good, "green", "bold") if ok else colored("✗ " + bad, "red", "bold")
 
 
 def menu_status():
@@ -208,7 +220,7 @@ def rdap_lookup(ip):
         with opener.open("https://rdap.org/ip/" + host(ip), timeout=3) as response:
             raw = response.read(512 * 1024 + 1)
         if len(raw) > 512 * 1024:
-            raise ValueError("RDAP response too large")
+            raise ValueError("Ответ RDAP превышает допустимый размер")
         return rdap_label(json.loads(raw))
     except (OSError, ValueError, TypeError, AttributeError):
         return "Не определено (RDAP недоступен)"
@@ -245,8 +257,14 @@ def lookup(ip):
 
 
 def top(resolve=True):
-    text = run("journalctl", "-k", "--since", "24 hours ago", "--grep=CBTC[46] ",
-               "-n", "10000", "-o", "json", "--no-pager", timeout=300).stdout
+    journal = run("journalctl", "-k", "--since", "24 hours ago", "--grep=CBTC[46] ",
+                  "-n", "10000", "-o", "json", "--no-pager",
+                  check=False, timeout=300)
+    # journalctl returns 1 when the filter has no matches; this is not a fault.
+    if journal.returncode not in (0, 1):
+        raise subprocess.CalledProcessError(journal.returncode, journal.args,
+                                            journal.stdout, journal.stderr)
+    text = journal.stdout
     rows = journal_top(text)
     labels = lookup_many([ip for ip, _ in rows]) if resolve and rows else {}
     print()
@@ -262,9 +280,34 @@ def top(resolve=True):
         label = labels[ip] if resolve else "Расшифровка отключена"
         print(f"  {index:<3} {colored(f'{ip:<39}', 'white')} {colored(f'{count:>8}', 'yellow')}  {colored(label, 'magenta')}")
     if not rows:
-        print(colored("  Пока нет записей: нужны логирование и новые блокировки.", "dim"))
+        print(colored("  ○ За последние 24 часа заблокированных обращений пока нет.", "dim"))
     print(colored("  Владелец сети не обязательно отправитель или хостер.", "dim"))
     rule("─", style="blue")
+
+
+def journal_output(*args):
+    result = run("journalctl", *args, check=False, timeout=300)
+    if result.returncode not in (0, 1):
+        raise subprocess.CalledProcessError(result.returncode, result.args,
+                                            result.stdout, result.stderr)
+    return result.stdout.strip()
+
+
+def print_logs():
+    print()
+    rule()
+    print(colored("  ЖУРНАЛЫ ЧЕБУРNET TRAFFIC CONTROL", "cyan", "bold"))
+    print()
+    print(colored("  ПОСЛЕДНИЕ БЛОКИРОВКИ", "magenta", "bold"))
+    blocked = journal_output("-k", "--since", "24 hours ago", "--grep=CBTC[46] ",
+                             "-n", "30", "-o", "short-iso", "--no-pager")
+    print(blocked or colored("  ○ За последние 24 часа записей нет.", "dim"))
+    print()
+    print(colored("  ОБНОВЛЕНИЕ ВНЕШНИХ СПИСКОВ", "magenta", "bold"))
+    updates = journal_output("-u", UNIT + "-update.service", "--since", "7 days ago",
+                             "-n", "20", "-o", "short-iso", "--no-pager")
+    print(updates or colored("  ○ За последние 7 дней записей нет.", "dim"))
+    rule()
 
 
 def fetch_lists():
@@ -284,6 +327,30 @@ def atomic(path, text, mode=0o600):
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
+
+
+def path_exists(path):
+    """Like lexists(): broken symlinks must also count as occupied paths."""
+    return os.path.lexists(path)
+
+
+def shortcut_valid():
+    try:
+        return SHORT_BIN.is_symlink() and os.readlink(SHORT_BIN) == str(BIN)
+    except OSError:
+        return False
+
+
+def write_shortcut():
+    if path_exists(SHORT_BIN) and not shortcut_valid():
+        raise ValueError(f"Путь {SHORT_BIN} занят чужим файлом; ярлык ctc не перезаписан.")
+    temporary = SHORT_BIN.parent / f".{SHORT_BIN.name}.new-{os.getpid()}"
+    temporary.unlink(missing_ok=True)
+    try:
+        os.symlink(str(BIN), temporary)
+        os.replace(temporary, SHORT_BIN)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def save(state):
@@ -364,7 +431,7 @@ def commit(state, old):
 def service_files():
     return {
         UNIT + ".service": f"""[Unit]
-Description=CheburNET Traffic Control: restore validated local lists
+Description=ЧебурNET Traffic Control: восстановление проверенных списков
 After=network-pre.target ufw.service nftables.service
 Before=network.target
 [Service]
@@ -375,7 +442,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 """,
         UNIT + "-update.service": f"""[Unit]
-Description=CheburNET Traffic Control: refresh lists
+Description=ЧебурNET Traffic Control: обновление внешних списков
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -384,7 +451,7 @@ ExecStart={BIN} update
 TimeoutStartSec=300
 """,
         UNIT + "-update.timer": f"""[Unit]
-Description=CheburNET Traffic Control: daily list refresh
+Description=ЧебурNET Traffic Control: ежедневное обновление списков
 [Timer]
 OnBootSec=15min
 OnUnitActiveSec=1d
@@ -393,17 +460,77 @@ RandomizedDelaySec=30min
 WantedBy=timers.target
 """,
         UNIT + "-rollback.service": f"""[Unit]
-Description=CheburNET Traffic Control: unconfirmed activation rollback
+Description=ЧебурNET Traffic Control: откат неподтверждённого включения
 [Service]
 Type=oneshot
 ExecStart={BIN} rollback
 """,
         UNIT + "-rollback.timer": """[Unit]
-Description=CheburNET Traffic Control: activation safety timer
+Description=ЧебурNET Traffic Control: таймер безопасного включения
 [Timer]
 OnActiveSec=120s
 AccuracySec=1s
 """}
+
+
+def unit_state(action, name):
+    try:
+        result = run("systemctl", action, name, check=False)
+        return result.stdout.strip() or "неизвестно"
+    except (OSError, subprocess.SubprocessError):
+        return "недоступно"
+
+
+def format_updated(timestamp):
+    try:
+        return datetime.fromtimestamp(timestamp).astimezone().strftime("%d.%m.%Y %H:%M:%S %Z")
+    except (OSError, OverflowError, TypeError, ValueError):
+        return "неизвестно"
+
+
+def component_report(state):
+    """Compact, human-readable report used by status and the main menu."""
+    try:
+        table = present()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        table = False
+    enabled = (ROOT / "enabled").exists()
+    pending = (ROOT / "pending").exists()
+    service_enabled = unit_state("is-enabled", UNIT + ".service") == "enabled"
+    timer_active = unit_state("is-active", UNIT + "-update.timer") == "active"
+    if pending:
+        protection = colored("◷ ПРОБНОЕ ВКЛЮЧЕНИЕ", "yellow", "bold")
+    elif enabled and table:
+        protection = colored("✓ АКТИВНА", "green", "bold")
+    elif enabled:
+        protection = colored("✗ ТРЕБУЕТ ВОССТАНОВЛЕНИЯ", "red", "bold")
+    else:
+        protection = colored("○ ВЫКЛЮЧЕНА", "yellow", "bold")
+    print()
+    rule("─", style="blue")
+    print(colored("  ОТЧЁТ О РАБОТЕ КОМПОНЕНТОВ", "blue", "bold"))
+    print()
+    print(f"  Защита входящего трафика : {protection}")
+    if table:
+        table_status = status_mark(True, "ЗАГРУЖЕНА")
+    elif enabled or pending:
+        table_status = status_mark(False, bad="ОТСУТСТВУЕТ")
+    else:
+        table_status = colored("○ не загружена — защита выключена", "yellow")
+    print(f"  Таблица nftables          : {table_status}")
+    if enabled:
+        startup = status_mark(service_enabled, "ВКЛЮЧЕНО", "ВЫКЛЮЧЕНО")
+        updates = status_mark(timer_active, "АКТИВНО", "НЕАКТИВНО")
+    else:
+        startup = colored("○ включится после подтверждения защиты", "yellow")
+        updates = colored("○ включится после подтверждения защиты", "yellow")
+    print(f"  Восстановление при старте : {startup}")
+    print(f"  Ежедневное обновление     : {updates}")
+    print(f"  Внешние списки            : {sum(len(x) for x in state['lists'].values())} сетей/адресов")
+    print(f"  Разрешённые IP            : {len(state['allow'])}")
+    print(f"  Журналирование блокировок : {'ВКЛЮЧЕНО' if state.get('logging') else 'ВЫКЛЮЧЕНО'}")
+    print(f"  Последнее обновление      : {format_updated(state.get('updated'))}")
+    rule("─", style="blue")
 
 
 def port_list(value):
@@ -428,6 +555,34 @@ def ask_yes(label):
         if answer in ("н", "нет", "n", "no"):
             return False
         print("Введите Д или Н.")
+
+
+def brand_header():
+    print()
+    rule()
+    print(colored("  ЧебурNET · TRAFFIC CONTROL", "cyan", "bold"))
+    print(colored("  УПРАВЛЕНИЕ ЗАЩИТОЙ ВХОДЯЩЕГО ТРАФИКА", "magenta", "bold"))
+    print(colored("  Тестовая версия · " + VERSION, "yellow"))
+    print(colored("  Автор и разработчик: Леонид Копысов", "white"))
+    print(colored("  GitHub: leonidkopysov · Telegram: @kopysovleonid", "dim"))
+    rule()
+
+
+def confirm_install_start(confirmed=False):
+    if confirmed:
+        return
+    if not sys.stdin.isatty():
+        raise ValueError("Для автоматической установки добавьте --yes.")
+    brand_header()
+    print(colored("  ПЕРЕД НАЧАЛОМ", "cyan", "bold"))
+    print()
+    print("  Скрипт проверит зависимости, загрузит три внешних списка,")
+    print("  сохранит конфигурацию и установит службы восстановления.")
+    print(colored("  Фильтрация не включится до отдельной пробной активации.", "yellow", "bold"))
+    print(colored("  Держите доступ к консоли VPS до завершения проверки.", "red", "bold"))
+    print()
+    if not ask_yes("  Продолжить установку?"):
+        raise ValueError("Установка отменена пользователем.")
 
 
 def ask_value(label, candidate, validator):
@@ -502,6 +657,8 @@ def install_inputs(args):
 def install(args):
     if STATE.exists() or BIN.exists() or present():
         raise ValueError("Установка или таблица уже существует. Автоперезапись запрещена.")
+    if path_exists(SHORT_BIN) and not shortcut_valid():
+        raise ValueError(f"Путь {SHORT_BIN} уже занят. Установка ничего не изменила.")
     if any((SYSTEMD / name).exists() for name in service_files()):
         raise ValueError("Конфликт имён systemd. Ничего не перезаписано.")
     if shutil.which("traffic-guard") or Path("/opt/trafficguard-manager.sh").exists():
@@ -515,11 +672,12 @@ def install(args):
     try:
         save(state)
         atomic(BIN, Path(__file__).read_text(encoding="utf-8"), 0o755)
+        write_shortcut()
         for name, body in service_files().items():
             atomic(SYSTEMD / name, body, 0o644)
         run("systemctl", "daemon-reload")
     except BaseException:
-        for path in [*(SYSTEMD / name for name in service_files()), BIN, STATE]:
+        for path in [*(SYSTEMD / name for name in service_files()), SHORT_BIN, BIN, STATE]:
             try:
                 path.unlink(missing_ok=True)
             except OSError:
@@ -534,18 +692,21 @@ def install(args):
             except OSError:
                 pass
         raise
-    print("✓ Установлено. Фильтрация ещё выключена. Выполните: cheburnet-traffic-control activate")
+    print(colored("  ✓ Компонент установлен, конфигурация сохранена.", "green", "bold"))
+    print(colored("  ○ Фильтрация пока выключена. Для проверки выберите пробное включение в меню.", "yellow"))
 
 
 def activate():
     state = load()
     if (ROOT / "enabled").exists() or (ROOT / "pending").exists():
-        raise ValueError("Уже включено или ожидает confirm. См. status.")
+        raise ValueError("Защита уже включена или ожидает подтверждения. Выполните: ctc s")
     atomic(ROOT / "pending", str(time.time()))
     run("systemctl", "restart", UNIT + "-rollback.timer")
     apply(state)
-    print("◷ Включено на 120 секунд. Проверьте НОВОЕ SSH-подключение и связь с панелью.")
-    print("Затем: cheburnet-traffic-control confirm. Без подтверждения фильтрация отключится.")
+    print(colored("  ◷ Защита пробно включена на 120 секунд.", "yellow", "bold"))
+    print("  Проверьте НОВОЕ SSH-подключение, панель и VPN.")
+    print(colored("  Если всё работает, подтвердите: ctc ok", "green", "bold"))
+    print(colored("  Без подтверждения правила будут автоматически удалены.", "red"))
 
 
 def disable(units=True):
@@ -555,7 +716,172 @@ def disable(units=True):
     if units:
         run("systemctl", "disable", "--now", UNIT + "-update.timer", check=False)
         run("systemctl", "disable", UNIT + ".service", check=False)
-    print("○ Собственная фильтрация выключена; остальные правила не изменены.")
+    print(colored("  ○ Защита ЧебурNET выключена; остальные правила firewall не изменены.", "yellow"))
+
+
+def file_is_secure(path, executable=False):
+    try:
+        mode = path.stat().st_mode
+        return path.is_file() and path.stat().st_uid == 0 and not mode & 0o022 and (not executable or mode & 0o111)
+    except OSError:
+        return False
+
+
+def lists_complete(state):
+    lists = state.get("lists")
+    if not isinstance(lists, dict):
+        return False
+    expected = set(SOURCES)
+    actual = set(lists)
+    return actual == expected and all(lists.get(name) for name in expected)
+
+
+def diagnostic_items(state):
+    items = []
+
+    def add(name, ok, detail):
+        items.append((name, bool(ok), detail))
+
+    missing = missing_packages()
+    tools_ok = bool(shutil.which("systemctl")) and bool(shutil.which("journalctl"))
+    add("Системные зависимости", not missing and tools_ok and sys.version_info >= (3, 10),
+        "установлены" if not missing and tools_ok else "не все команды доступны")
+    add("Система инициализации", tools_ok and Path("/run/systemd/system").is_dir(),
+        "systemd работает" if Path("/run/systemd/system").is_dir() else "systemd не активен")
+    lists_ok = lists_complete(state)
+    add("Три внешних списка", lists_ok,
+        "загружены" if lists_ok else "состав списков неполный")
+    try:
+        try:
+            rules_exist = present()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            rules_exist = False
+        rendered = render(state, rules_exist)
+        syntax = run("nft", "-c", "-f", "-", data=rendered,
+                     check=False, timeout=300).returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        syntax = False
+    add("Синтаксис правил", syntax, "проверен nftables" if syntax else "проверка не пройдена")
+    try:
+        binary_current = (file_is_secure(BIN, executable=True) and
+                          BIN.read_text(encoding="utf-8") == Path(__file__).read_text(encoding="utf-8"))
+    except OSError:
+        binary_current = False
+    add("Основной файл", binary_current,
+        "актуален и защищён" if binary_current else "отсутствует, устарел или имеет неверные права")
+    add("Короткая команда ctc", shortcut_valid(), str(SHORT_BIN))
+    try:
+        config_ok = (ROOT.stat().st_mode & 0o777 == 0o700 and
+                     STATE.stat().st_mode & 0o777 == 0o600 and STATE.stat().st_uid == 0)
+    except OSError:
+        config_ok = False
+    add("Права конфигурации", config_ok, "0700/0600" if config_ok else "требуют восстановления")
+    units_ok = True
+    for name, body in service_files().items():
+        path = SYSTEMD / name
+        try:
+            units_ok = (units_ok and file_is_secure(path) and
+                        path.read_text(encoding="utf-8") == body)
+        except OSError:
+            units_ok = False
+    add("Службы systemd", units_ok, "актуальны" if units_ok else "требуют восстановления")
+    enabled = (ROOT / "enabled").exists()
+    pending = (ROOT / "pending").exists()
+    try:
+        table = present()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        table = False
+    if pending:
+        add("Пробное включение", table and unit_state("is-active", UNIT + "-rollback.timer") == "active",
+            "защитный таймер активен")
+    elif enabled:
+        add("Рабочая таблица", table, "загружена" if table else "отсутствует")
+        service_ok = unit_state("is-enabled", UNIT + ".service") == "enabled"
+        timer_ok = (unit_state("is-enabled", UNIT + "-update.timer") == "enabled" and
+                    unit_state("is-active", UNIT + "-update.timer") == "active")
+        add("Автовосстановление", service_ok, "включено" if service_ok else "выключено")
+        add("Автообновление", timer_ok, "таймер активен" if timer_ok else "таймер неактивен")
+    else:
+        add("Выключенный режим", not table, "правила не применены" if not table else "найдена лишняя таблица")
+    return items
+
+
+def print_diagnostics(state):
+    items = diagnostic_items(state)
+    print()
+    rule()
+    print(colored("  САМОДИАГНОСТИКА ЧЕБУРNET", "cyan", "bold"))
+    print()
+    for name, ok, detail in items:
+        mark = colored("✓", "green", "bold") if ok else colored("✗", "red", "bold")
+        print(f"  {mark} {name}: {detail}")
+    failed = sum(not ok for _, ok, _ in items)
+    print()
+    if failed:
+        print(colored(f"  Обнаружено проблем: {failed}. Запустите: ctc fix", "red", "bold"))
+    else:
+        print(colored("  ✓ Все проверяемые компоненты работают штатно.", "green", "bold"))
+    rule()
+    return failed
+
+
+def repair(state, confirmed=False):
+    if (ROOT / "pending").exists():
+        raise ValueError("Сначала завершите пробное включение командой ctc ok либо ctc off.")
+    if not confirmed:
+        if not sys.stdin.isatty():
+            raise ValueError("Для автоматического восстановления добавьте --yes.")
+        if not ask_yes("  Исправить обнаруженные компоненты автоматически?"):
+            raise ValueError("Восстановление отменено пользователем.")
+    if not lists_complete(state):
+        repaired_state = json.loads(json.dumps(state))
+        repaired_state["lists"] = fetch_lists()
+        repaired_state["updated"] = int(time.time())
+        commit(repaired_state, state)
+        state = repaired_state
+    current_source = Path(__file__).read_text(encoding="utf-8")
+    ROOT.chmod(0o700)
+    STATE.chmod(0o600)
+    atomic(BIN, current_source, 0o755)
+    write_shortcut()
+    for name, body in service_files().items():
+        atomic(SYSTEMD / name, body, 0o644)
+    run("systemctl", "daemon-reload")
+    if (ROOT / "enabled").exists():
+        apply(state)
+        run("systemctl", "enable", UNIT + ".service")
+        run("systemctl", "enable", "--now", UNIT + "-update.timer")
+    else:
+        remove_table()
+        run("systemctl", "disable", "--now", UNIT + "-update.timer", check=False)
+        run("systemctl", "disable", "--now", UNIT + ".service", check=False)
+    print(colored("  ✓ Восстановление завершено. Повторяю диагностику.", "green", "bold"))
+    return print_diagnostics(state)
+
+
+def print_status(state):
+    component_report(state)
+    print()
+    print(colored("  НАСТРОЙКИ", "cyan", "bold"))
+    print(f"  Версия                    : {VERSION}")
+    print(f"  Порты SSH                 : {', '.join(map(str, state['ssh_ports']))}")
+    print(f"  Разрешённые IP            : {', '.join(state['allow'])}")
+    print(f"  Ручные блокировки         : {len(state['manual'])}")
+    for name, entries in state["lists"].items():
+        print(f"  Список {name:<18}: {len(entries)} записей")
+    print()
+    print(colored("  Полные правила: ctc r", "dim"))
+
+
+def print_rules():
+    print()
+    rule()
+    print(colored("  ПОЛНЫЕ ПРАВИЛА NFTABLES", "cyan", "bold"))
+    rule()
+    if not present():
+        print(colored("  ○ Таблица ЧебурNET сейчас не загружена.", "yellow"))
+        return
+    print(run("nft", "list", "table", "inet", TABLE, timeout=300).stdout)
 
 
 def execute(args):
@@ -567,19 +893,28 @@ def execute(args):
     if cmd == "top":
         top(not args.no_resolve)
     elif cmd == "status":
-        print(json.dumps({"version": VERSION, "table_present": present(),
-              "enabled": (ROOT / "enabled").exists(), "pending": (ROOT / "pending").exists(),
-              "updated": state["updated"], "sources": {k: len(v) for k, v in state["lists"].items()},
-              "allow": state["allow"], "ssh_ports": state["ssh_ports"], "manual": state["manual"]},
-              ensure_ascii=False, indent=2))
-        if present():
-            print(run("nft", "list", "table", "inet", TABLE).stdout)
+        if args.json:
+            print(json.dumps({"version": VERSION, "table_present": present(),
+                  "enabled": (ROOT / "enabled").exists(), "pending": (ROOT / "pending").exists(),
+                  "updated": state["updated"], "sources": {k: len(v) for k, v in state["lists"].items()},
+                  "allow": state["allow"], "ssh_ports": state["ssh_ports"], "manual": state["manual"]},
+                  ensure_ascii=False, indent=2))
+        else:
+            print_status(state)
+    elif cmd == "rules":
+        print_rules()
+    elif cmd == "logs":
+        print_logs()
+    elif cmd == "check":
+        return print_diagnostics(state)
+    elif cmd == "repair":
+        return repair(state, args.yes)
     elif cmd == "activate":
         activate()
     elif cmd == "confirm":
         pending = ROOT / "pending"
         if not pending.exists() or time.time() - float(pending.read_text(encoding="utf-8")) >= 120 or not present():
-            raise ValueError("Нет действующего пробного включения; выполните activate снова.")
+            raise ValueError("Нет действующего пробного включения; выполните ctc on снова.")
         atomic(ROOT / "enabled", "1\n")
         try:
             run("systemctl", "enable", UNIT + ".service")
@@ -589,7 +924,7 @@ def execute(args):
             raise
         pending.unlink()
         run("systemctl", "stop", UNIT + "-rollback.timer")
-        print("✓ Подтверждено: автозагрузка и обновление включены.")
+        print(colored("  ✓ Защита подтверждена: восстановление и обновление включены.", "green", "bold"))
     elif cmd == "rollback":
         if (ROOT / "pending").exists():
             disable()
@@ -607,12 +942,14 @@ def execute(args):
         run("systemctl", "stop", UNIT + "-rollback.timer", UNIT + ".service")
         for name in service_files():
             (SYSTEMD / name).unlink(missing_ok=True)
+        if shortcut_valid():
+            SHORT_BIN.unlink(missing_ok=True)
         BIN.unlink(missing_ok=True)
         run("systemctl", "daemon-reload")
-        print("✓ Программа и её systemd-файлы удалены. Конфигурация сохранена в " + str(ROOT))
+        print("✓ Программа, короткая команда и службы удалены. Конфигурация сохранена в " + str(ROOT))
     elif cmd in ("update", "ban", "unban", "allow", "disallow"):
         if (ROOT / "pending").exists():
-            raise ValueError("Сначала confirm либо disable.")
+            raise ValueError("Сначала подтвердите или выключите пробный режим: ctc ok либо ctc off.")
         old = json.loads(json.dumps(state))
         if cmd == "update":
             state["lists"] = fetch_lists()
@@ -634,7 +971,9 @@ def execute(args):
                 if key == "allow" and not state[key]:
                     raise ValueError("Нельзя удалить последнее исключение.")
         commit(state, old)
-        print("✓ Сохранено. Исключения и SSH имеют приоритет над блокировками.")
+        action = "Три внешних списка обновлены." if cmd == "update" else "Изменения сохранены."
+        print(colored("  ✓ " + action, "green", "bold"))
+        print("  Исключения и SSH имеют приоритет над блокировками.")
         if cmd == "unban":
             print("Удалён только ручной бан. Для исключения из внешних списков используйте allow IP.")
 
@@ -643,27 +982,24 @@ def menu():
     while True:
         if sys.stdout.isatty():
             print("\033[2J\033[H", end="")
-        print()
-        rule()
-        print(colored("  ЧебурNET · TRAFFIC CONTROL", "cyan", "bold"))
-        print(colored("  ТЕСТОВАЯ ВЕРСИЯ · " + VERSION, "magenta", "bold"))
-        print(colored("  Автор и разработчик: Леонид Копысов", "white"))
-        print(colored("  Telegram: @kopysovleonid", "dim"))
-        print("  Состояние: " + menu_status())
-        rule()
+        brand_header()
         installed = STATE.exists()
         if installed:
             try:
-                main(["top"])
+                state = load()
+                component_report(state)
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
-                print(colored("  Топ недоступен: " + safe_label(exc), "red"))
+                print(colored("  ✗ Отчёт недоступен: " + safe_label(exc), "red", "bold"))
+        else:
+            print()
+            print(colored("  ○ Компонент ещё не установлен.", "yellow", "bold"))
         print()
-        print(colored("  ГЛАВНОЕ МЕНЮ", "cyan", "bold"))
+        print(colored("  ГЛАВНОЕ МЕНЮ", "magenta", "bold"))
         print()
         if not installed:
             menu_line("1", "Установить компонент (защита останется выключенной)", "green")
         else:
-            menu_line("1", "Показать состояние и правила", "blue")
+            menu_line("1", "Показать краткое состояние", "blue")
             menu_line("2", "Обновить три внешних списка", "blue")
             menu_line("3", "Добавить ручной бан IP или CIDR", "yellow")
             menu_line("4", "Снять точный ручной бан", "green")
@@ -673,7 +1009,16 @@ def menu():
             menu_line("8", "Подтвердить пробное включение", "green")
             menu_line("9", "Выключить защиту", "yellow")
             menu_line("10", "Удалить компонент", "red")
+            menu_line("11", "Самодиагностика и исправление", "magenta")
+            menu_line("12", "Показать полные правила nftables", "blue")
+            menu_line("13", "Показать последние журналы", "blue")
         menu_line("0", "Выход", "white")
+        if installed:
+            try:
+                top()
+            except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                print()
+                print(colored("  ✗ Топ-10 временно недоступен: " + safe_label(exc), "red"))
         print()
         rule("─", style="cyan")
         choice = input(colored("  Выберите действие: ", "cyan", "bold")).strip()
@@ -682,7 +1027,8 @@ def menu():
         command = ("install" if not installed and choice == "1" else
                    {"1": "status", "2": "update", "3": "ban", "4": "unban",
                     "5": "allow", "6": "disallow", "7": "activate", "8": "confirm",
-                    "9": "disable", "10": "uninstall"}.get(choice) if installed else None)
+                    "9": "disable", "10": "uninstall", "11": "check",
+                    "12": "rules", "13": "logs"}.get(choice) if installed else None)
         if not command:
             continue
         args = [command]
@@ -693,16 +1039,28 @@ def menu():
                 continue
             args.append("--yes")
         try:
-            main(args)
+            problems = main(args)
+            if command == "check" and problems and ask_yes("  Исправить обнаруженные проблемы?"):
+                main(["repair", "--yes"])
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             print(colored("  ✗ " + str(exc), "red", "bold"))
         if command == "uninstall":
             return
+        if command == "install":
+            continue
         input(colored("  Enter — вернуться в меню: ", "dim"))
 
 
+def normalize_argv(argv):
+    values = list(argv)
+    if values and values[0] in COMMAND_ALIASES:
+        values[0] = COMMAND_ALIASES[values[0]]
+    return values
+
+
 def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
+    direct_invocation = argv is None
+    argv = normalize_argv(sys.argv[1:] if argv is None else argv)
     if not argv:
         if not sys.stdin.isatty():
             raise ValueError("Без терминала укажите команду, например --help.")
@@ -710,36 +1068,67 @@ def main(argv=None):
             raise ValueError("Запуск только от root.")
         menu()
         return
-    parser = argparse.ArgumentParser(description="ЧебурNET Traffic Control — фильтрация входящих IP. Тестовая версия.")
-    parser.add_argument("--version", action="version", version=VERSION)
-    subs = parser.add_subparsers(dest="command", required=True)
-    inst = subs.add_parser("install", help="Установка БЕЗ включения фильтрации")
-    inst.add_argument("--ssh-port", action="append", type=int)
-    inst.add_argument("--allow", action="append", default=[])
-    inst.add_argument("--no-logging", action="store_false", dest="logging")
+    parser = argparse.ArgumentParser(
+        description="ЧебурNET Traffic Control — управление защитой входящего трафика. Тестовая версия.")
+    parser.add_argument("--version", action="version", version=VERSION, help="показать версию")
+    subs = parser.add_subparsers(dest="command", required=True, title="команды")
+    inst = subs.add_parser("install", help="установить компонент без включения защиты")
+    inst.add_argument("--ssh-port", action="append", type=int, help="порт SSH; можно указать несколько раз")
+    inst.add_argument("--allow", action="append", default=[], help="разрешённый IP; можно указать несколько раз")
+    inst.add_argument("--yes", action="store_true", help="Подтвердить автоматическую установку")
+    inst.add_argument("--no-logging", action="store_false", dest="logging", help="отключить журнал блокировок")
     inst.set_defaults(logging=True)
-    subs.add_parser("top").add_argument("--no-resolve", action="store_true")
-    for cmd in ("status", "activate", "confirm", "disable", "restore", "rollback", "update"):
-        subs.add_parser(cmd)
-    for cmd in ("ban", "unban", "allow", "disallow"):
-        subs.add_parser(cmd).add_argument("address")
-    subs.add_parser("uninstall").add_argument("--yes", action="store_true")
+    top_parser = subs.add_parser("top", help="показать топ-10 заблокированных IP")
+    top_parser.add_argument("--no-resolve", action="store_true", help="не запрашивать организации через RDAP")
+    status_parser = subs.add_parser("status", help="показать краткий отчёт")
+    status_parser.add_argument("--json", action="store_true", help="вывести машинный JSON")
+    command_help = {
+        "rules": "показать полные правила nftables", "logs": "показать последние журналы",
+        "check": "выполнить самодиагностику",
+        "activate": "пробно включить защиту", "confirm": "подтвердить пробное включение",
+        "disable": "выключить защиту", "restore": "восстановить правила из локальной копии",
+        "rollback": "выполнить аварийный откат", "update": "обновить три внешних списка",
+    }
+    for cmd, help_text in command_help.items():
+        subs.add_parser(cmd, help=help_text)
+    repair_parser = subs.add_parser("repair", help="исправить обнаруженные проблемы")
+    repair_parser.add_argument("--yes", action="store_true", help="подтвердить автоматическое восстановление")
+    address_help = {
+        "ban": "добавить ручную блокировку", "unban": "удалить точную ручную блокировку",
+        "allow": "добавить IP в исключения", "disallow": "удалить IP из исключений",
+    }
+    for cmd, help_text in address_help.items():
+        subs.add_parser(cmd, help=help_text).add_argument("address", help="IP или допустимый CIDR")
+    uninstall_parser = subs.add_parser("uninstall", help="удалить программу и службы")
+    uninstall_parser.add_argument("--yes", action="store_true", help="подтвердить удаление")
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
         raise ValueError("Запуск только от root.")
+    if args.command == "install":
+        confirm_install_start(args.yes)
+    if args.command == "repair" and not args.yes:
+        if not sys.stdin.isatty():
+            raise ValueError("Для автоматического восстановления добавьте --yes.")
+        brand_header()
+        if not ask_yes("  Запустить восстановление компонентов?"):
+            raise ValueError("Восстановление отменено пользователем.")
+        args.yes = True
     try:
-        ensure_dependencies(auto_install=args.command == "install")
+        if args.command != "check":
+            ensure_dependencies(auto_install=args.command in ("install", "repair"))
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         raise ValueError(str(exc)) from exc
     os.umask(0o077)
     if args.command == "top":
         # Slow external RDAP queries must never delay the activation rollback lock.
-        execute(args)
-        return
+        return execute(args)
     # Root-owned /run lock serializes timer, user changes, activation and rollback.
     with open("/run/cheburnet-traffic-control.lock", "w", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        execute(args)
+        result = execute(args)
+    if args.command == "install" and direct_invocation and sys.stdin.isatty():
+        menu()
+    return result
 
 
 if __name__ == "__main__":
