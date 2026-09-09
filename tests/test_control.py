@@ -163,6 +163,42 @@ class ControlTests(unittest.TestCase):
         self.assertIn('[10]  Удалить компонент', text)
         self.assertNotIn('\033[', text)
 
+    def test_os_release(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'os-release'
+            path.write_text('ID="ubuntu"\nID_LIKE=debian\n# COMMENT=x\n')
+            self.assertEqual(c.os_release(path), {'ID': 'ubuntu', 'ID_LIKE': 'debian'})
+
+    def test_missing_packages(self):
+        with patch.object(c.shutil, 'which', return_value=None), patch.object(c, 'CA_CERT') as ca_cert:
+            ca_cert.is_file.return_value = False
+            self.assertEqual(c.missing_packages(), ['nftables', 'ca-certificates'])
+
+    def test_dependencies_do_not_call_apt_when_present(self):
+        with patch.object(c, 'missing_packages', return_value=[]), patch.object(c.shutil, 'which', return_value='/bin/tool'), patch.object(c.Path, 'is_dir', return_value=True), patch.object(c, 'apt_install') as apt:
+            c.ensure_dependencies(auto_install=True)
+            apt.assert_not_called()
+
+    def test_dependencies_install_only_missing(self):
+        with patch.object(c, 'missing_packages', side_effect=[['nftables'], []]), patch.object(c, 'apt_install') as apt, patch.object(c.shutil, 'which', return_value='/bin/tool'), patch.object(c.Path, 'is_dir', return_value=True):
+            c.ensure_dependencies(auto_install=True)
+            apt.assert_called_once_with(['nftables'])
+
+    def test_dependencies_without_auto_install(self):
+        with patch.object(c, 'missing_packages', return_value=['nftables']), self.assertRaises(ValueError):
+            c.ensure_dependencies(auto_install=False)
+
+    def test_apt_rejects_unsupported_os(self):
+        with patch.object(c, 'os_release', return_value={'ID': 'fedora'}), patch.object(c.shutil, 'which', return_value='/usr/bin/apt-get'), patch.object(c.subprocess, 'run') as run, self.assertRaises(ValueError):
+            c.apt_install(['nftables'])
+        run.assert_not_called()
+
+    def test_apt_commands(self):
+        with patch.object(c, 'os_release', return_value={'ID': 'debian'}), patch.object(c.shutil, 'which', return_value='/usr/bin/apt-get'), patch.object(c.subprocess, 'run') as run:
+            c.apt_install(['nftables', 'ca-certificates'])
+        self.assertEqual(run.call_args_list[0].args[0], ['apt-get', 'update'])
+        self.assertEqual(run.call_args_list[1].args[0][-2:], ['nftables', 'ca-certificates'])
+
 
 if __name__ == "__main__":
     unittest.main()
