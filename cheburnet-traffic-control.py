@@ -25,7 +25,7 @@ import textwrap
 import time
 import urllib.request
 
-VERSION = "1.0.1-audit"
+VERSION = "1.0.1"
 WIDTH = 78
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")

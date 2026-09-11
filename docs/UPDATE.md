@@ -1,4 +1,4 @@
-# Обновление до 1.0.0
+# Обновление до 1.0.1
 
 Для уже установленной программы повторный `install` не нужен. Обновите исполняемый файл,
 затем обновите службы через `repair`. Исключения, SSH-порты и ручные блокировки сохраняются.
@@ -15,11 +15,11 @@ ctc_download_dir=$(mktemp -d /tmp/ctc-update.XXXXXX)
 trap 'rm -rf -- "$ctc_download_dir"' EXIT
 cd "$ctc_download_dir"
 curl -fsSLo cheburnet-traffic-control.py \
-  https://raw.githubusercontent.com/leonidkopysov/CheburNET-Traffic-Control/v1.0.0/cheburnet-traffic-control.py
+  https://raw.githubusercontent.com/leonidkopysov/CheburNET-Traffic-Control/v1.0.1/cheburnet-traffic-control.py
 curl -fsSLo SHA256SUMS \
-  https://raw.githubusercontent.com/leonidkopysov/CheburNET-Traffic-Control/v1.0.0/SHA256SUMS
+  https://raw.githubusercontent.com/leonidkopysov/CheburNET-Traffic-Control/v1.0.1/SHA256SUMS
 sha256sum -c SHA256SUMS
-test "$(python3 ./cheburnet-traffic-control.py --version)" = '1.0.0'
+test "$(python3 ./cheburnet-traffic-control.py --version)" = '1.0.1'
 (
   flock -x 9
   test -f /usr/local/bin/cheburnet-traffic-control
@@ -42,7 +42,7 @@ test "$(python3 ./cheburnet-traffic-control.py --version)" = '1.0.0'
 CTC_UPDATE
 ```
 
-После успешного обновления `ctc --version` показывает `1.0.0`. Откройте меню командой `sudo ctc`.
+После успешного обновления `ctc --version` показывает `1.0.1`. Откройте меню командой `sudo ctc`.
 Если фильтрация была выключена, она останется выключенной: включите её через `sudo ctc on`, когда готовы.
 Если была включена, отдельное выключение и включение для обновления не требуются.
 

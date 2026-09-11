@@ -1,8 +1,8 @@
 <p align="center"><img src="assets/cheburnet-scripts-banner.jpg" alt="ЧебурNET — авторские инструменты для Linux-серверов" width="100%"></p>
 <h1 align="center">ЧебурNET · Traffic Control</h1>
-<p align="center">Управление фильтрацией входящего трафика Linux-сервера</p>
+<p align="center">Сетевая защита Linux-сервера от сканирования портов и нежелательных подключений</p>
 <p align="center">
-  <a href="https://github.com/leonidkopysov/CheburNET-Traffic-Control/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/версия-1.0.0-00bcd4" alt="Версия 1.0.0"></a>
+  <a href="https://github.com/leonidkopysov/CheburNET-Traffic-Control/releases/tag/v1.0.1"><img src="https://img.shields.io/badge/версия-1.0.1-00bcd4" alt="Версия 1.0.1"></a>
   <a href="https://github.com/leonidkopysov/CheburNET-Traffic-Control/actions/workflows/test.yml"><img src="https://github.com/leonidkopysov/CheburNET-Traffic-Control/actions/workflows/test.yml/badge.svg" alt="Автоматические проверки"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/лицензия-MIT-00bcd4" alt="Лицензия MIT"></a>
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776ab" alt="Python 3.10 и новее">
@@ -11,9 +11,12 @@
 <a href="https://github.com/leonidkopysov">GitHub · leonidkopysov</a> ·
 <a href="https://t.me/kopysovleonid">Telegram · @kopysovleonid</a></p>
 
-Самостоятельный менеджер блокировок IPv4/IPv6 на Python и nftables. Загружает три внешних списка,
-применяет правила, обновляет их по расписанию и показывает состояние на русском языке.
-Управление — через меню или короткую команду `ctc`.
+Утилита сетевой защиты Linux-сервера от автоматического сканирования портов и нежелательных
+подключений. Блокирует известные IP-адреса и подсети сканеров на уровне nftables, включая сети
+российских государственных структур, Роскомнадзора и связанных с ними организаций при использовании
+соответствующих списков блокировки. Поддерживает IPv4/IPv6, три внешних списка, логирование и статистику
+срабатываний. Установка начинается только после согласия пользователя. Управление — через русское меню
+или короткую команду `ctc`.
 
 **[Установка](#установка) · [Команды](#команды) · [Обновление](docs/UPDATE.md) · [Диагностика](#диагностика-и-журналы) · [Поддержка](SUPPORT.md)**
 
@@ -35,7 +38,7 @@
 Рабочая короткая команда с автоматическим определением IP текущего SSH-подключения:
 
 ```bash
-curl -fsSL https://github.com/leonidkopysov/CheburNET-Traffic-Control/releases/download/v1.0.0/cheburnet-traffic-control.py -o ctc.py && sudo env SSH_CONNECTION="${SSH_CONNECTION:-}" python3 ctc.py install
+curl -fsSL https://github.com/leonidkopysov/CheburNET-Traffic-Control/releases/download/v1.0.1/cheburnet-traffic-control.py -o ctc.py && sudo env SSH_CONNECTION="${SSH_CONNECTION:-}" python3 ctc.py install
 ```
 
 Скрипт будет сохранён в текущем каталоге как `ctc.py`, после чего запустится интерактивная установка.
@@ -48,33 +51,32 @@ curl -fsSL https://github.com/leonidkopysov/CheburNET-Traffic-Control/releases/d
 Python должен быть установлен заранее. Практическая проверка прежней сборки проводилась на Ubuntu 24.04.4;
 полная матрица ОС не проверялась.
 
-Скачайте скрипт и контрольную сумму из фиксированного релиза **v1.0.0**:
+Скачайте скрипт и контрольную сумму из фиксированного релиза **v1.0.1**:
 
 ```bash
 curl -fsSLo cheburnet-traffic-control.py \
-  https://raw.githubusercontent.com/leonidkopysov/CheburNET-Traffic-Control/v1.0.0/cheburnet-traffic-control.py &&
+  https://raw.githubusercontent.com/leonidkopysov/CheburNET-Traffic-Control/v1.0.1/cheburnet-traffic-control.py &&
 curl -fsSLo SHA256SUMS \
-  https://raw.githubusercontent.com/leonidkopysov/CheburNET-Traffic-Control/v1.0.0/SHA256SUMS &&
+  https://raw.githubusercontent.com/leonidkopysov/CheburNET-Traffic-Control/v1.0.1/SHA256SUMS &&
 sha256sum -c SHA256SUMS &&
 sudo env SSH_CONNECTION="${SSH_CONNECTION:-}" python3 ./cheburnet-traffic-control.py install
 ```
 
-Скрипт покажет аннотацию и запросит подтверждение установки. IP администратора и порт SSH предлагаются
+Скрипт покажет аннотацию и обязательно запросит подтверждение установки. Параметр `--yes` считается
+явным согласием, переданным пользователем в команде. IP администратора и порт SSH предлагаются
 из текущего подключения: подтвердите их или введите свои. Для панели используются подходящие настройки
 Vision Installer (`panel_ips` в `/opt/remnanode/settings.json`), иначе потребуется ручной ввод.
 Нужен **исходящий IP панели**: адрес домена за CDN может отличаться от него.
 
-После установки появятся отчёт о компонентах и главное меню. Выберите **«Включить фильтрацию»**
-или выполните:
+После проверки и сохранения конфигурации фильтрация, восстановление после перезагрузки и ежедневное
+обновление включаются автоматически. Затем появятся отчёт о компонентах и главное меню. Проверьте состояние:
 
 ```bash
-sudo ctc on
 sudo ctc s
 ```
 
-Включение сразу применяет правила и настраивает восстановление после перезагрузки и ежедневное обновление.
-Дополнительного подтверждения включения нет. Проверьте исключения администратора и панели перед включением,
-а после — новое SSH-подключение и связь панели с нодой. Держите доступной консоль провайдера.
+Проверьте новое SSH-подключение и связь панели с нодой. До завершения проверки держите доступной
+консоль провайдера.
 
 Существующий TrafficGuard требуется сначала штатно удалить; автоматического переноса его настроек нет.
 Если Traffic Control уже установлен, используйте **[инструкцию обновления](docs/UPDATE.md)**.
@@ -88,7 +90,6 @@ sudo ctc s
 ```bash
 sudo python3 ./cheburnet-traffic-control.py install \
   --yes --ssh-port 22 --allow 198.51.100.10 --allow 198.51.100.20
-sudo ctc on
 ```
 
 </details>
@@ -195,11 +196,13 @@ sudo ctc uninstall --yes
 ```
 
 Удаляются собственная таблица, программа, короткая команда и службы. Конфигурация остаётся
-в `/var/lib/cheburnet-traffic-control/`; повторная установка поверх неё намеренно запрещена.
+в `/var/lib/cheburnet-traffic-control/`. Повторная установка проверяет и восстанавливает сохранённую
+конфигурацию, после чего включает фильтрацию.
 
 ## Документация проекта
 
 - [Первый релиз 1.0.0](docs/RELEASE-1.0.0.md)
+- [Релиз 1.0.1](docs/RELEASE-1.0.1.md)
 - [Обновление установленной версии](docs/UPDATE.md)
 - [Поддержка и сообщения об ошибках](SUPPORT.md)
 - [Сообщения об уязвимостях](SECURITY.md)
