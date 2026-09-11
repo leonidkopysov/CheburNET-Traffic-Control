@@ -914,7 +914,7 @@ def confirm_install_start(confirmed=False):
     print()
     print("  Скрипт проверит зависимости, загрузит три внешних списка,")
     print("  сохранит конфигурацию и установит службы восстановления.")
-    info("После установки выберите «Включить фильтрацию» в меню.")
+    info("После проверки фильтрация будет включена автоматически.")
     warn("Держите доступ к консоли VPS до завершения проверки.")
     print()
     if not ask_yes("  Продолжить установку?"):
@@ -1030,7 +1030,9 @@ def install(args):
         result = repair(state, confirmed=True)
         if result:
             raise ValueError("Повторная установка завершилась, но самодиагностика нашла проблемы.")
-        ok("Повторная установка завершена; действующая конфигурация сохранена.")
+        if not (ROOT / "enabled").exists():
+            activate()
+        ok("Повторная установка завершена; конфигурация сохранена, фильтрация включена.")
         return
     if present():
         raise ValueError("Таблица nftables с именем ЧебурNET уже существует. Автоперезапись запрещена.")
@@ -1070,7 +1072,7 @@ def install(args):
                 pass
         raise
     ok("Компонент установлен, конфигурация сохранена.")
-    info("Фильтрация пока выключена. Выберите «Включить фильтрацию» в меню или выполните ctc on.")
+    activate()
 
 
 def activate():
@@ -1420,7 +1422,7 @@ def menu():
         print(colored("  ГЛАВНОЕ МЕНЮ", "magenta", "bold"))
         print()
         if not installed:
-            menu_line("1", "Установить компонент (фильтрация останется выключенной)", "green")
+            menu_line("1", "Установить компонент и включить фильтрацию", "green")
         else:
             menu_section("Просмотр")
             menu_line("1", "Показать краткое состояние", "blue")
@@ -1537,7 +1539,7 @@ def main(argv=None):
                         help="показать номер версии и выйти")
     subs = parser.add_subparsers(dest="command", required=True, title="команды", metavar="КОМАНДА")
     inst = subs.add_parser("install", prog=parser.prog + " install", usage="%(prog)s [ПАРАМЕТРЫ]",
-                           help="установить компонент без включения фильтрации")
+                           help="установить компонент и включить фильтрацию")
     inst.add_argument("--ssh-port", action="append", type=port_number, metavar="ПОРТ",
                       help="порт SSH; параметр можно указать несколько раз")
     inst.add_argument("--allow", action="append", default=[], metavar="IP",
