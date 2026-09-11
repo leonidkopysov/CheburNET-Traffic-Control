@@ -385,9 +385,41 @@ class ControlTests(unittest.TestCase):
                      lists={name: ['198.51.100.0/24'] for name in c.SOURCES},
                      updated=1, logging=True)
         with patch.object(c, 'preflight_install', return_value='existing'), \
-             patch.object(c, 'load', return_value=state), patch.object(c, 'repair', return_value=0) as repair:
+             patch.object(c, 'load', return_value=state), \
+             patch.object(c, 'repair', return_value=0) as repair, \
+             patch.object(c, 'activate') as activate, patch.object(c, 'ROOT') as root:
+            root.__truediv__.return_value.exists.return_value = False
             c.install(Namespace(logging=True))
         repair.assert_called_once_with(state, confirmed=True)
+        activate.assert_called_once_with()
+
+    def test_repeated_install_keeps_active_filtering_active(self):
+        state = self.state()
+        with patch.object(c, 'preflight_install', return_value='existing'), \
+             patch.object(c, 'load', return_value=state), \
+             patch.object(c, 'repair', return_value=0), \
+             patch.object(c, 'activate') as activate, patch.object(c, 'ROOT') as root:
+            root.__truediv__.return_value.exists.return_value = True
+            c.install(Namespace(logging=True))
+        activate.assert_not_called()
+
+    def test_fresh_install_activates_filtering(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            root, systemd = base / 'state', base / 'systemd'
+            systemd.mkdir()
+            binary, short, state_file = base / 'bin', base / 'ctc', root / 'state.json'
+            lists = {name: ['198.51.100.0/24'] for name in c.SOURCES}
+            with patch.object(c, 'ROOT', root), patch.object(c, 'STATE', state_file), \
+                 patch.object(c, 'BIN', binary), patch.object(c, 'SHORT_BIN', short), \
+                 patch.object(c, 'SYSTEMD', systemd), \
+                 patch.object(c, 'preflight_install', return_value='new'), \
+                 patch.object(c, 'present', return_value=False), \
+                 patch.object(c, 'install_inputs', return_value=([22], ['198.51.100.9'])), \
+                 patch.object(c, 'fetch_lists', return_value=lists), \
+                 patch.object(c, 'run'), patch.object(c, 'activate') as activate:
+                c.install(Namespace(logging=True))
+            activate.assert_called_once_with()
 
     def test_menu_requires_root_before_opening(self):
         with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.object(c.os, 'geteuid', return_value=1000), patch.object(c, 'menu') as menu, self.assertRaises(ValueError):
