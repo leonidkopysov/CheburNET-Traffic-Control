@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import io
 from argparse import Namespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("control", Path(__file__).parents[1] / "cheburnet-traffic-control.py")
@@ -77,6 +78,17 @@ class ControlTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 c.networks(value)
 
+    def test_indirect_default_routes_are_rejected_after_collapse(self):
+        for value in ("0.0.0.0/1\n128.0.0.0/1", "::/1\n8000::/1"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "покрывает весь"):
+                c.networks(value)
+
+    def test_render_rejects_default_route_created_across_lists(self):
+        state = self.state()
+        state["lists"] = {"a": ["0.0.0.0/1"], "b": ["128.0.0.0/1"]}
+        with self.assertRaisesRegex(ValueError, "Совокупность блокировок"):
+            c.render(state)
+
     def test_ipv6(self):
         self.assertEqual(c.networks("2001:db8::1"), ["2001:db8::1/128"])
 
@@ -139,6 +151,27 @@ class ControlTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     c.commit({"new": True}, {"old": True})
                 self.assertEqual(apply.call_args_list[1].args, ({"old": True},))
+
+    def test_state_validation_rejects_missing_and_wrong_fields(self):
+        valid = dict(schema=1, ssh_ports=[22], allow=['198.51.100.9'], manual=[],
+                     lists={name: ['198.51.100.0/24'] for name in c.SOURCES},
+                     updated=1, logging=True)
+        self.assertEqual(c.validate_state(valid)['ssh_ports'], [22])
+        for change in ({'ssh_ports': []}, {'allow': []}, {'logging': 'yes'},
+                       {'lists': {'wrong': ['198.51.100.0/24']}}):
+            broken = dict(valid, **change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                c.validate_state(broken)
+
+    def test_state_validation_rejects_combined_default_route(self):
+        lists = {name: ['198.51.100.0/24'] for name in c.SOURCES}
+        names = list(c.SOURCES)
+        lists[names[0]] = ['0.0.0.0/1']
+        lists[names[1]] = ['128.0.0.0/1']
+        state = dict(schema=1, ssh_ports=[22], allow=['198.51.100.9'], manual=[],
+                     lists=lists, updated=1, logging=True)
+        with self.assertRaisesRegex(ValueError, 'совокупные блокировки'):
+            c.validate_state(state)
 
     def test_https_redirect(self):
         with self.assertRaises(ValueError):
@@ -212,6 +245,14 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(labels, {"1.1.1.1": "Cloudflare", "8.8.8.8": "Google"})
             lookup.assert_called_once_with("8.8.8.8")
 
+    def test_bad_rdap_cache_entry_is_ignored(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "rdap-cache.json").write_text(
+                json.dumps({"1.1.1.1": {"time": "bad", "label": "bad"}}), encoding="utf-8")
+            with patch.object(c, "ROOT", root), patch.object(c, "rdap_lookup", return_value="Cloudflare"):
+                self.assertEqual(c.lookup_many(["1.1.1.1"]), {"1.1.1.1": "Cloudflare"})
+
     def test_interactive_accept(self):
         with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.dict(c.os.environ, {'SSH_CONNECTION': '1.2.3.4 50000 5.6.7.8 2222'}), patch.object(c, 'panel_hint', return_value='9.8.7.6'), patch('builtins.input', side_effect=['д', 'д', 'д', 'д']):
             self.assertEqual(c.install_inputs(Namespace(ssh_port=None, allow=[])), ([2222], ['1.2.3.4', '9.8.7.6']))
@@ -233,8 +274,23 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(c.ask_value('SSH', '', c.port_list), [22])
 
     def test_domain_requires_confirmation(self):
-        with patch.object(c.socket, 'getaddrinfo', return_value=[(2, 1, 6, '', ('1.2.3.4', 0))]), patch('builtins.input', return_value='н'), self.assertRaises(ValueError):
+        result = c.subprocess.CompletedProcess(('getent',), 0, '1.2.3.4 STREAM panel.example.com\n', '')
+        with patch.object(c.shutil, 'which', return_value='/usr/bin/getent'), \
+             patch.object(c, 'run', return_value=result), patch('builtins.input', return_value='н'), \
+             self.assertRaises(ValueError):
             c.panel_input('panel.example.com')
+
+    def test_domain_lookup_has_timeout(self):
+        result = c.subprocess.CompletedProcess(('getent',), 0, '1.2.3.4 STREAM panel.example.com\n', '')
+        with patch.object(c.shutil, 'which', return_value='/usr/bin/getent'), \
+             patch.object(c, 'run', return_value=result) as run, patch('builtins.input', return_value='д'):
+            self.assertEqual(c.panel_input('panel.example.com'), ['1.2.3.4'])
+        self.assertEqual(run.call_args.kwargs['timeout'], 10)
+
+    def test_yes_no_accepts_russian_and_english(self):
+        for answer, expected in [('Да', True), ('YES', True), ('Нет', False), ('n', False)]:
+            with self.subTest(answer=answer), patch('builtins.input', return_value=answer):
+                self.assertEqual(c.ask_yes('Продолжить?'), expected)
 
     def test_vision_field_only(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -258,13 +314,23 @@ class ControlTests(unittest.TestCase):
         with patch.object(c.sys.stdout, 'isatty', return_value=True), patch.dict(c.os.environ, {}, clear=True):
             self.assertIn('\033[92m', c.colored('Тест', 'green'))
 
+    def test_redirected_stderr_does_not_receive_ansi(self):
+        class Terminal(io.StringIO):
+            encoding = 'utf-8'
+            def isatty(self):
+                return True
+        output, errors = Terminal(), io.StringIO()
+        with patch('sys.stdout', output), patch.dict(c.os.environ, {}, clear=True):
+            c.err('ошибка', file=errors)
+        self.assertNotIn('\033[', errors.getvalue())
+
     def test_vertical_menu_before_install(self):
         output = io.StringIO()
         with patch.object(c.sys.stdout, 'isatty', return_value=False), patch.object(c, 'STATE') as state, patch('builtins.input', return_value='0'), patch('sys.stdout', output):
             state.exists.return_value = False
             c.menu()
         text = output.getvalue()
-        self.assertIn('Версия 1.0.0', text)
+        self.assertIn('Версия ' + c.VERSION, text)
         self.assertNotIn('ТЕСТОВАЯ ВЕРСИЯ', text)
         self.assertIn('[ 1] Установить компонент', text)
         self.assertNotIn('[10]  Удалить компонент', text)
@@ -304,6 +370,25 @@ class ControlTests(unittest.TestCase):
             c.main(['install'])
         dependencies.assert_not_called()
 
+    def test_install_conflict_precedes_confirmation_and_dependencies(self):
+        with patch.object(c.os, 'geteuid', return_value=0), \
+             patch.object(c, 'preflight_install', side_effect=ValueError('конфликт')), \
+             patch.object(c, 'confirm_install_start') as confirmation, \
+             patch.object(c, 'ensure_dependencies') as dependencies, \
+             self.assertRaisesRegex(ValueError, 'конфликт'):
+            c.main(['install'])
+        confirmation.assert_not_called()
+        dependencies.assert_not_called()
+
+    def test_repeated_install_repairs_without_changing_configuration(self):
+        state = dict(schema=1, ssh_ports=[22], allow=['198.51.100.9'], manual=[],
+                     lists={name: ['198.51.100.0/24'] for name in c.SOURCES},
+                     updated=1, logging=True)
+        with patch.object(c, 'preflight_install', return_value='existing'), \
+             patch.object(c, 'load', return_value=state), patch.object(c, 'repair', return_value=0) as repair:
+            c.install(Namespace(logging=True))
+        repair.assert_called_once_with(state, confirmed=True)
+
     def test_menu_requires_root_before_opening(self):
         with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.object(c.os, 'geteuid', return_value=1000), patch.object(c, 'menu') as menu, self.assertRaises(ValueError):
             c.main([])
@@ -332,7 +417,7 @@ class ControlTests(unittest.TestCase):
                 if args == ('systemctl', 'daemon-reload') and kwargs.get('check', True):
                     raise OSError('daemon-reload failed')
 
-            lists = {'test': ['198.51.100.0/24']}
+            lists = {name: ['198.51.100.0/24'] for name in c.SOURCES}
             with patch.object(c, 'ROOT', root), patch.object(c, 'STATE', state_file), \
                  patch.object(c, 'BIN', binary), patch.object(c, 'SHORT_BIN', short), \
                  patch.object(c, 'SYSTEMD', systemd), \
@@ -453,6 +538,18 @@ class ControlTests(unittest.TestCase):
     def test_systemd_descriptions_are_russian(self):
         self.assertTrue(all('Description=ЧебурNET' in body for body in c.service_files().values()))
 
+    def test_update_service_timeout_covers_internal_timeouts(self):
+        self.assertIn('TimeoutStartSec=15min', c.service_files()[c.UNIT + '-update.service'])
+
+    def test_disable_keeps_marker_when_table_removal_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'enabled').touch()
+            with patch.object(c, 'ROOT', root), patch.object(c, 'remove_table', side_effect=OSError('nft')):
+                with self.assertRaises(OSError):
+                    c.disable()
+            self.assertTrue((root / 'enabled').exists())
+
     def test_successful_diagnostics_prints_final_result(self):
         output = io.StringIO()
         with patch.object(c, 'diagnostic_items', return_value=[('Проверка', True, 'исправно')]), \
@@ -508,6 +605,21 @@ class ControlTests(unittest.TestCase):
     def test_dependencies_without_auto_install(self):
         with patch.object(c, 'missing_packages', return_value=['nftables']), self.assertRaises(ValueError):
             c.ensure_dependencies(auto_install=False)
+
+    def test_supported_platform_matrix(self):
+        for values, machine, expected in [
+                ({'ID': 'ubuntu', 'VERSION_ID': '22.04'}, 'x86_64', ('ubuntu', '22.04', 'amd64')),
+                ({'ID': 'ubuntu', 'VERSION_ID': '24.04'}, 'aarch64', ('ubuntu', '24.04', 'arm64')),
+                ({'ID': 'debian', 'VERSION_ID': '12'}, 'x86_64', ('debian', '12', 'amd64'))]:
+            with self.subTest(values=values, machine=machine), patch.object(c, 'os_release', return_value=values), \
+                 patch.object(c.os, 'uname', return_value=SimpleNamespace(machine=machine)):
+                self.assertEqual(c.platform_details(), expected)
+
+    def test_unsupported_platform_is_rejected(self):
+        with patch.object(c, 'os_release', return_value={'ID': 'ubuntu', 'VERSION_ID': '20.04'}), \
+             patch.object(c.os, 'uname', return_value=SimpleNamespace(machine='x86_64')), \
+             self.assertRaisesRegex(ValueError, 'Неподдерживаемая система'):
+            c.platform_details()
 
     def test_apt_rejects_unsupported_os(self):
         with patch.object(c, 'os_release', return_value={'ID': 'fedora'}), patch.object(c.shutil, 'which', return_value='/usr/bin/apt-get'), patch.object(c.subprocess, 'run') as run, self.assertRaises(ValueError):
