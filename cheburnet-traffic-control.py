@@ -8,6 +8,7 @@ import argparse
 import codecs
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime
 import fcntl
 import ipaddress
@@ -16,7 +17,7 @@ import os
 import re
 from pathlib import Path
 import shutil
-import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,7 @@ import textwrap
 import time
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.0.1-audit"
 WIDTH = 78
 TABLE = "cheburnet_tc"
 ROOT = Path("/var/lib/cheburnet-traffic-control")
@@ -41,11 +42,17 @@ MAX_ENTRIES = 150000
 LABEL_LIMIT = 100
 CA_CERT = Path("/etc/ssl/certs/ca-certificates.crt")
 OS_RELEASE = Path("/etc/os-release")
+LOCK_FILE = Path("/run/cheburnet-traffic-control.lock")
+SUPPORTED_SYSTEMS = {"ubuntu": {"22.04", "24.04"}, "debian": {"12"}}
+SUPPORTED_ARCHITECTURES = {
+    "x86_64": "amd64", "amd64": "amd64",
+    "aarch64": "arm64", "arm64": "arm64",
+}
 
 ANSI = {
     "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
     "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
-    "blue": "\033[96m", "magenta": "\033[2m", "cyan": "\033[96m",
+    "blue": "\033[94m", "magenta": "\033[95m", "cyan": "\033[96m",
     "white": "\033[97m",
     "badge_green": "\033[42m\033[30m", "badge_yellow": "\033[43m\033[30m",
     "badge_red": "\033[41m\033[97m",
@@ -53,21 +60,28 @@ ANSI = {
 
 COMMAND_ALIASES = {
     "s": "status", "t": "top", "c": "check", "r": "rules",
-    "l": "logs", "u": "update", "on": "activate", "ok": "confirm",
+    "l": "logs", "u": "update", "on": "activate",
     "off": "disable", "fix": "repair",
 }
 
 
-def colored(text, *styles):
+def stream_supports_decoration(stream=None):
+    stream = stream or sys.stdout
+    return (hasattr(stream, "isatty") and stream.isatty()
+            and "NO_COLOR" not in os.environ and utf8_output(stream))
+
+
+def colored(text, *styles, stream=None):
     """Use ANSI only in an interactive terminal; logs and pipes stay clean."""
-    if not sys.stdout.isatty() or "NO_COLOR" in os.environ:
+    stream = stream or sys.stdout
+    if not hasattr(stream, "isatty") or not stream.isatty() or "NO_COLOR" in os.environ:
         return str(text)
     return "".join(ANSI[x] for x in styles) + str(text) + ANSI["reset"]
 
 
-def utf8_output():
+def utf8_output(stream=None):
     """Return whether terminal symbols are safe for the current stdout."""
-    encoding = getattr(sys.stdout, "encoding", None)
+    encoding = getattr(stream or sys.stdout, "encoding", None)
     if not encoding:
         return False
     try:
@@ -76,7 +90,7 @@ def utf8_output():
         return False
 
 
-def symbol(name):
+def symbol(name, stream=None):
     unicode_symbols = {
         "heavy": "─", "light": "─", "ok": "✓", "warn": "!",
         "error": "✗", "info": "›", "idle": "!", "pending": "!",
@@ -85,11 +99,11 @@ def symbol(name):
         "heavy": "-", "light": "-", "ok": "[OK]", "warn": "!",
         "error": "[ERR]", "info": ">", "idle": "!", "pending": "!",
     }
-    return (unicode_symbols if decorated() else ascii_symbols)[name]
+    return (unicode_symbols if decorated(stream) else ascii_symbols)[name]
 
 
-def decorated():
-    return sys.stdout.isatty() and "NO_COLOR" not in os.environ and utf8_output()
+def decorated(stream=None):
+    return stream_supports_decoration(stream)
 
 
 def vislen(text):
@@ -117,7 +131,7 @@ def term_width():
 
 
 def terminal_width():
-    """Fit the interface to the current terminal without exceeding 100 columns."""
+    """Fit the interface to the current terminal without exceeding 78 columns."""
     return term_width()
 
 
@@ -132,13 +146,14 @@ def rule(char=None, width=None, style="cyan"):
 def message(kind, text, *styles, file=None):
     marks = {"ok": "ok", "warn": "warn", "error": "error", "info": "info", "pending": "pending"}
     colors = {"ok": "green", "warn": "yellow", "error": "red", "info": "dim", "pending": "yellow"}
-    prefix = f"  {symbol(marks[kind])} "
+    stream = file or sys.stdout
+    prefix = f"  {symbol(marks[kind], stream)} "
     available = max(1, terminal_width() - len(prefix))
     lines = textwrap.wrap(str(text), width=available, replace_whitespace=False,
                           drop_whitespace=True) or [""]
     for index, line in enumerate(lines):
         rendered = (prefix if index == 0 else "  ") + line
-        print(colored(rendered, colors[kind], *styles), file=file)
+        print(colored(rendered, colors[kind], *styles, stream=stream), file=file)
 
 
 def ok(text):
@@ -179,7 +194,7 @@ def field(label, value):
 
 
 def menu_line(key, label, style="white"):
-    style = "red" if key == "10" else "white"
+    style = "red" if key == "10" else style
     token = f"[{pad_left(key, 2)}] "
     prefix = "  " + token
     available = max(1, terminal_width() - len(prefix))
@@ -234,6 +249,25 @@ def os_release(path=OS_RELEASE):
     return values
 
 
+def platform_details():
+    """Validate the operating system and architecture promised by this release."""
+    values = os_release()
+    system = values.get("ID", "").lower()
+    version = values.get("VERSION_ID", "").strip()
+    supported_versions = SUPPORTED_SYSTEMS.get(system)
+    if not supported_versions or not any(
+            version == item or version.startswith(item + ".") for item in supported_versions):
+        expected = "Ubuntu 22.04/24.04 или Debian 12"
+        raise ValueError(f"Неподдерживаемая система: {system or 'не определена'} "
+                         f"{version or ''}. Требуется {expected}.")
+    machine = os.uname().machine.lower()
+    architecture = SUPPORTED_ARCHITECTURES.get(machine)
+    if not architecture:
+        raise ValueError("Неподдерживаемая архитектура: " + machine
+                         + ". Поддерживаются amd64 и arm64.")
+    return system, version, architecture
+
+
 def missing_packages():
     packages = []
     if not shutil.which("nft"):
@@ -260,6 +294,7 @@ def apt_install(packages):
 def ensure_dependencies(auto_install=False):
     if sys.version_info < (3, 10):
         raise ValueError("Требуется Python 3.10 или новее.")
+    platform_details()
     packages = missing_packages()
     if packages and not auto_install:
         raise ValueError("Не установлены пакеты: " + ", ".join(packages) + ".")
@@ -291,8 +326,11 @@ def networks(text):
             raise ValueError("Слишком много записей в списке.")
     if not result:
         raise ValueError("Пустой список не принимается.")
-    return [str(n) for version in (4, 6) for n in ipaddress.collapse_addresses(
+    collapsed = [n for version in (4, 6) for n in ipaddress.collapse_addresses(
         n for n in result if n.version == version)]
+    if any(net.prefixlen == 0 for net in collapsed):
+        raise ValueError("Список после объединения покрывает весь IPv4 или IPv6; применение запрещено.")
+    return [str(net) for net in collapsed]
 
 
 class HTTPSOnly(urllib.request.HTTPRedirectHandler):
@@ -365,9 +403,22 @@ def lookup_many(addresses):
         cache = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
     now = time.time()
-    cache = {k: v for k, v in cache.items()
-             if isinstance(v, dict) and now - v.get("time", 0) < 7 * 86400}
+    valid_cache = {}
+    for key, value in cache.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        timestamp = value.get("time")
+        label = value.get("label")
+        if (isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
+                and isinstance(label, str) and 0 <= now - timestamp < 7 * 86400):
+            try:
+                valid_cache[host(key)] = {"time": float(timestamp), "label": safe_label(label)}
+            except ValueError:
+                continue
+    cache = valid_cache
     result = {ip: cache[ip]["label"] for ip in addresses
               if ip in cache and isinstance(cache[ip].get("label"), str)}
     missing = [ip for ip in addresses if ip not in result]
@@ -382,10 +433,6 @@ def lookup_many(addresses):
         cache = dict(sorted(cache.items(), key=lambda item: item[1]["time"], reverse=True)[:999])
     atomic(path, json.dumps(cache, ensure_ascii=False))
     return result
-
-
-def lookup(ip):
-    return lookup_many([ip])[ip]
 
 
 def top(resolve=True, limit=10):
@@ -484,9 +531,36 @@ def atomic(path, text, mode=0o600):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
+
+
+@contextmanager
+def exclusive_lock(path=LOCK_FILE):
+    """Open the process lock without following a pre-created symbolic link."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        details = os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or details.st_uid != 0
+                or details.st_mode & 0o022):
+            raise ValueError(f"Небезопасный файл блокировки: {path}")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fd = -1
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def path_exists(path):
@@ -514,18 +588,95 @@ def write_shortcut():
 
 
 def save(state):
+    state = validate_state(state)
     atomic(STATE, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
 
 
 def load():
-    state = json.loads(STATE.read_text(encoding="utf-8"))
-    if state.get("schema") != 1:
-        raise ValueError("Неизвестная версия конфигурации.")
-    return state
+    if path_exists(ROOT) and not directory_is_secure(ROOT):
+        raise ValueError("Каталог конфигурации имеет небезопасный тип, владельца или права доступа.")
+    if path_exists(STATE) and not file_is_secure(STATE):
+        raise ValueError("Файл конфигурации имеет небезопасный тип, владельца или права доступа.")
+    try:
+        state = json.loads(STATE.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError("Компонент не установлен: файл конфигурации отсутствует.") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("Файл конфигурации повреждён: некорректный JSON.") from exc
+    return validate_state(state)
 
 
 def host(value):
     return str(ipaddress.ip_address(value))
+
+
+def network_values(values, label, allow_empty=True):
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise ValueError(f"Некорректное поле конфигурации «{label}».")
+    if not values:
+        if allow_empty:
+            return []
+        raise ValueError(f"Поле конфигурации «{label}» не должно быть пустым.")
+    try:
+        return networks("\n".join(values))
+    except ValueError as exc:
+        raise ValueError(f"Некорректное поле конфигурации «{label}»: {exc}") from exc
+
+
+def reject_default_coverage(values, label):
+    try:
+        parsed = [ipaddress.ip_network(value, strict=False) for value in values]
+    except ValueError as exc:
+        raise ValueError(f"Некорректное поле конфигурации «{label}».") from exc
+    collapsed = [net for version in (4, 6) for net in ipaddress.collapse_addresses(
+        net for net in parsed if net.version == version)]
+    if any(net.prefixlen == 0 for net in collapsed):
+        raise ValueError(f"Поле «{label}» после объединения покрывает весь IPv4 или IPv6.")
+
+
+def validate_state(state):
+    """Return a canonical, bounded state or reject it before generating firewall rules."""
+    if not isinstance(state, dict) or state.get("schema") != 1:
+        raise ValueError("Неизвестная или повреждённая версия конфигурации.")
+    ports = state.get("ssh_ports")
+    if (not isinstance(ports, list) or not ports
+            or any(not isinstance(port, int) or isinstance(port, bool)
+                   or port < 1 or port > 65535 for port in ports)):
+        raise ValueError("Некорректное поле конфигурации «ssh_ports».")
+    allow = state.get("allow")
+    if not isinstance(allow, list) or not allow or any(not isinstance(value, str) for value in allow):
+        raise ValueError("Некорректное поле конфигурации «allow».")
+    try:
+        allow = sorted(set(host(value) for value in allow))
+    except ValueError as exc:
+        raise ValueError("Некорректное поле конфигурации «allow».") from exc
+    lists = state.get("lists")
+    if not isinstance(lists, dict) or set(lists) != set(SOURCES):
+        raise ValueError("Некорректный состав внешних списков в конфигурации.")
+    normalized_lists = {
+        name: network_values(lists[name], f"lists.{name}", allow_empty=False)
+        for name in SOURCES
+    }
+    manual = network_values(state.get("manual"), "manual")
+    # A default route may emerge only after lists and manual entries are combined.
+    reject_default_coverage(
+        [item for values in normalized_lists.values() for item in values] + manual,
+        "совокупные блокировки")
+    updated = state.get("updated")
+    if not isinstance(updated, (int, float)) or isinstance(updated, bool) or updated < 0:
+        raise ValueError("Некорректное поле конфигурации «updated».")
+    logging = state.get("logging")
+    if not isinstance(logging, bool):
+        raise ValueError("Некорректное поле конфигурации «logging».")
+    return {
+        "schema": 1,
+        "ssh_ports": sorted(set(ports)),
+        "allow": allow,
+        "manual": manual,
+        "lists": normalized_lists,
+        "updated": int(updated),
+        "logging": logging,
+    }
 
 
 def render(state, exists=False):
@@ -538,9 +689,13 @@ def render(state, exists=False):
         blocked.extend(ipaddress.ip_network(x, strict=False) for x in entries)
     if any(n.prefixlen == 0 for n in blocked):
         raise ValueError("Блокировка /0 запрещена.")
+    collapsed_blocked = [n for version in (4, 6) for n in ipaddress.collapse_addresses(
+        n for n in blocked if n.version == version)]
+    if any(net.prefixlen == 0 for net in collapsed_blocked):
+        raise ValueError("Совокупность блокировок покрывает весь IPv4 или IPv6; применение запрещено.")
     lines = [f"delete table inet {TABLE}"] if exists else []
     lines += [f"table inet {TABLE} {{"]
-    for prefix, items in (("allow", allowed), ("block", blocked)):
+    for prefix, items in (("allow", allowed), ("block", collapsed_blocked)):
         for version in (4, 6):
             nets = list(ipaddress.collapse_addresses(n for n in items if n.version == version))
             lines += [f" set {prefix}{version} {{", f"  type ipv{version}_addr;", "  flags interval;"]
@@ -597,6 +752,7 @@ Before=network.target
 [Service]
 Type=oneshot
 ExecStart={BIN} restore
+TimeoutStartSec=5min
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
@@ -608,7 +764,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart={BIN} update
-TimeoutStartSec=300
+TimeoutStartSec=15min
 """,
         UNIT + "-update.timer": f"""[Unit]
 Description=ЧебурNET Traffic Control: ежедневное обновление списков
@@ -624,6 +780,7 @@ Description=ЧебурNET Traffic Control: откат незавершённог
 [Service]
 Type=oneshot
 ExecStart={BIN} rollback
+TimeoutStartSec=5min
 """,
         UNIT + "-rollback.timer": """[Unit]
 Description=ЧебурNET Traffic Control: таймер безопасного включения
@@ -700,6 +857,16 @@ def port_list(value):
     return ports
 
 
+def port_number(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("порт должен быть целым числом") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("порт должен быть в диапазоне от 1 до 65535")
+    return port
+
+
 def ip_list(value):
     values = sorted(set(host(x) for x in value.replace(',', ' ').split()))
     if not values:
@@ -709,12 +876,12 @@ def ip_list(value):
 
 def ask_yes(label):
     while True:
-        answer = input(label + " [Д/Н]: ").strip().lower()
-        if answer in ("д", "да"):
+        answer = input(colored(label + " [Д/Н]: ", "yellow", "bold")).strip().lower()
+        if answer in ("д", "да", "y", "yes"):
             return True
-        if answer in ("н", "нет"):
+        if answer in ("н", "нет", "n", "no"):
             return False
-        warn("Введите Д или Н.")
+        warn("Введите Д/Да/Y/Yes или Н/Нет/N/No.")
 
 
 def brand_header():
@@ -761,7 +928,8 @@ def ask_value(label, candidate, validator):
             return validator(candidate)
     while True:
         try:
-            return validator(input("  " + label + " (введите своё значение): ").strip())
+            prompt = colored("  " + label + " (введите своё значение): ", "yellow", "bold")
+            return validator(input(prompt).strip())
         except (ValueError, OSError):
             warn("Некорректное значение. Повторите ввод.")
 
@@ -785,11 +953,25 @@ def panel_input(value):
         return ip_list(value)
     except ValueError:
         # Domain only: not a URL, port, CIDR, shell command or list of hostnames.
-        if not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?', value):
+        labels = value.split('.')
+        if (len(value) > 253 or not labels or any(
+                not re.fullmatch(r'(?!-)[A-Za-z0-9-]{1,63}(?<!-)', label)
+                for label in labels)):
             raise ValueError('Укажите IP или домен без https:// и пути.')
         warn('DNS домена может указывать на CDN, а не исходящий IP панели.')
-        addresses = sorted(set(host(item[4][0]) for item in socket.getaddrinfo(
-            value, None, type=socket.SOCK_STREAM)))
+        if not shutil.which('getent'):
+            raise ValueError('Не найдена команда getent для безопасного поиска домена.')
+        result = run('getent', 'ahosts', value, check=False, timeout=10)
+        if result.returncode not in (0, 2):
+            raise ValueError('Не удалось выполнить DNS-поиск домена.')
+        addresses = []
+        for line in result.stdout.splitlines():
+            candidate = line.split(maxsplit=1)[0] if line.split() else ''
+            try:
+                addresses.append(host(candidate))
+            except ValueError:
+                continue
+        addresses = sorted(set(addresses))
         info('Найдены адреса: ' + ', '.join(addresses))
         if not addresses or not ask_yes('  Это именно исходящие IP панели?'):
             raise ValueError('Введите исходящий IP панели вручную.')
@@ -823,21 +1005,47 @@ def install_inputs(args):
     return ports, allowed
 
 
-def install(args):
-    if STATE.exists() or BIN.exists() or present():
-        raise ValueError("Установка или таблица уже существует. Автоперезапись запрещена.")
-    if path_exists(SHORT_BIN) and not shortcut_valid():
-        raise ValueError(f"Путь {SHORT_BIN} уже занят. Установка ничего не изменила.")
-    if any((SYSTEMD / name).exists() for name in service_files()):
-        raise ValueError("Конфликт имён systemd. Ничего не перезаписано.")
+def preflight_install():
+    """Reject obvious path conflicts before apt or other system changes begin."""
+    if path_exists(STATE):
+        load()
+        return "existing"
+    occupied = []
+    for path in (BIN, SHORT_BIN, *(SYSTEMD / name for name in service_files())):
+        if path_exists(path):
+            occupied.append(str(path))
+    if occupied:
+        raise ValueError("Обнаружена незавершённая или чужая установка: "
+                         + ", ".join(occupied) + ". Системные файлы не изменены.")
     if shutil.which("traffic-guard") or Path("/opt/trafficguard-manager.sh").exists():
         raise ValueError("Обнаружен TrafficGuard. Сначала удалите его штатным способом.")
+    return "new"
+
+
+def install(args):
+    install_mode = preflight_install()
+    if install_mode == "existing":
+        state = load()
+        warn("Компонент уже установлен. Проверяю и восстанавливаю его без изменения настроек.")
+        result = repair(state, confirmed=True)
+        if result:
+            raise ValueError("Повторная установка завершилась, но самодиагностика нашла проблемы.")
+        ok("Повторная установка завершена; действующая конфигурация сохранена.")
+        return
+    if present():
+        raise ValueError("Таблица nftables с именем ЧебурNET уже существует. Автоперезапись запрещена.")
     ports, allow = install_inputs(args)
     state = dict(schema=1, ssh_ports=ports, allow=sorted(set(allow)), manual=[],
                  lists=fetch_lists(), updated=int(time.time()), logging=args.logging)
     run("nft", "-c", "-f", "-", data=render(state), timeout=300)
-    root_created = not ROOT.exists()
+    root_created = not path_exists(ROOT)
+    if not root_created:
+        details = ROOT.lstat()
+        if (not stat.S_ISDIR(details.st_mode) or ROOT.is_symlink()
+                or details.st_uid != 0 or details.st_mode & 0o022):
+            raise ValueError(f"Каталог {ROOT} существует, но небезопасен; установка остановлена.")
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ROOT.chmod(0o700)
     try:
         save(state)
         atomic(BIN, Path(__file__).read_text(encoding="utf-8"), 0o755)
@@ -900,8 +1108,10 @@ def finish_activation():
 
 
 def disable(units=True):
-    (ROOT / "enabled").unlink(missing_ok=True)
+    # Keep state markers intact if nftables removal fails, so diagnostics do not
+    # incorrectly report a disabled filter while its table is still loaded.
     remove_table()
+    (ROOT / "enabled").unlink(missing_ok=True)
     (ROOT / "pending").unlink(missing_ok=True)
     if units:
         run("systemctl", "disable", "--now", UNIT + "-update.timer", check=False)
@@ -911,8 +1121,19 @@ def disable(units=True):
 
 def file_is_secure(path, executable=False):
     try:
-        mode = path.stat().st_mode
-        return path.is_file() and path.stat().st_uid == 0 and not mode & 0o022 and (not executable or mode & 0o111)
+        details = path.lstat()
+        mode = details.st_mode
+        return (stat.S_ISREG(mode) and not path.is_symlink() and details.st_uid == 0
+                and not mode & 0o022 and (not executable or bool(mode & 0o111)))
+    except OSError:
+        return False
+
+
+def directory_is_secure(path):
+    try:
+        details = path.lstat()
+        return (stat.S_ISDIR(details.st_mode) and not path.is_symlink()
+                and details.st_uid == 0 and not details.st_mode & 0o022)
     except OSError:
         return False
 
@@ -932,6 +1153,14 @@ def diagnostic_items(state):
     def add(name, ok, detail):
         items.append((name, bool(ok), detail))
 
+    try:
+        system, version, architecture = platform_details()
+        platform_ok = True
+        platform_text = f"{system} {version}, {architecture}"
+    except ValueError as exc:
+        platform_ok = False
+        platform_text = str(exc)
+    add("Совместимость системы", platform_ok, platform_text)
     missing = missing_packages()
     tools_ok = bool(shutil.which("systemctl")) and bool(shutil.which("journalctl"))
     add("Системные зависимости", not missing and tools_ok and sys.version_info >= (3, 10),
@@ -961,7 +1190,7 @@ def diagnostic_items(state):
         "актуален и защищён" if binary_current else "отсутствует, устарел или имеет неверные права")
     add("Короткая команда ctc", shortcut_valid(), str(SHORT_BIN))
     try:
-        config_ok = (ROOT.stat().st_mode & 0o777 == 0o700 and
+        config_ok = (directory_is_secure(ROOT) and ROOT.stat().st_mode & 0o777 == 0o700 and
                      STATE.stat().st_mode & 0o777 == 0o600 and STATE.stat().st_uid == 0)
     except OSError:
         config_ok = False
@@ -1110,13 +1339,6 @@ def execute(args):
         return repair(state, args.yes)
     elif cmd == "activate":
         activate()
-    elif cmd == "confirm":
-        pending = ROOT / "pending"
-        if not pending.exists() or time.time() - float(pending.read_text(encoding="utf-8")) >= 120 or not present():
-            raise ValueError("Нет незавершённого включения; выполните "
-                             "cheburnet-traffic-control activate снова.")
-        finish_activation()
-        ok("Включение завершено: восстановление и обновление включены.")
     elif cmd == "rollback":
         if (ROOT / "pending").exists():
             disable()
@@ -1131,7 +1353,9 @@ def execute(args):
         if not args.yes:
             raise ValueError("Удаление требует --yes. Списки сохранятся в " + str(ROOT))
         disable()
-        run("systemctl", "stop", UNIT + "-rollback.timer", UNIT + ".service")
+        run("systemctl", "stop", UNIT + "-update.service",
+            UNIT + "-rollback.timer", UNIT + "-rollback.service",
+            UNIT + ".service", check=False)
         for name in service_files():
             (SYSTEMD / name).unlink(missing_ok=True)
         if shortcut_valid():
@@ -1215,14 +1439,15 @@ def menu():
             menu_line("10", "Удаление программы и служб", "red")
         menu_line("0", "Выход", "white")
         if installed:
+            top_limit = 5 if height < 30 else 10
             try:
-                top(limit=5 if height < 30 else 10)
+                top(limit=top_limit)
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 print()
-                err("Топ-10 временно недоступен: " + safe_label(exc))
+                err(f"Топ-{top_limit} временно недоступен: " + safe_label(exc))
         print()
         rule("─", style="cyan")
-        choice = input(colored("  Выберите действие: ", "cyan", "bold")).strip()
+        choice = input(colored("  Выберите действие: ", "yellow", "bold")).strip()
         if choice == "0":
             return
         command = ("install" if not installed and choice == "1" else
@@ -1234,9 +1459,10 @@ def menu():
             continue
         args = [command]
         if command in ("ban", "unban", "allow", "disallow"):
-            args.append(input(colored("  IP (для ручного бана также CIDR): ", "cyan")).strip())
+            args.append(input(colored("  IP (для ручного бана также CIDR): ",
+                                      "yellow", "bold")).strip())
         if command == "uninstall":
-            if input(colored("  Выполнить удаление? Введите Д: ", "red", "bold")).strip().lower() != "д":
+            if not ask_yes("  Выполнить удаление программы и служб?"):
                 continue
             args.append("--yes")
         try:
@@ -1249,7 +1475,7 @@ def menu():
             return
         if command == "install":
             continue
-        input(colored("  Enter — вернуться в меню: ", "dim"))
+        input(colored("  Нажмите Enter, чтобы вернуться в меню: ", "yellow", "bold"))
 
 
 def normalize_argv(argv):
@@ -1312,7 +1538,7 @@ def main(argv=None):
     subs = parser.add_subparsers(dest="command", required=True, title="команды", metavar="КОМАНДА")
     inst = subs.add_parser("install", prog=parser.prog + " install", usage="%(prog)s [ПАРАМЕТРЫ]",
                            help="установить компонент без включения фильтрации")
-    inst.add_argument("--ssh-port", action="append", type=int, metavar="ПОРТ",
+    inst.add_argument("--ssh-port", action="append", type=port_number, metavar="ПОРТ",
                       help="порт SSH; параметр можно указать несколько раз")
     inst.add_argument("--allow", action="append", default=[], metavar="IP",
                       help="добавить IP в исключения; параметр можно указать несколько раз")
@@ -1338,8 +1564,6 @@ def main(argv=None):
     }
     for cmd, help_text in command_help.items():
         subs.add_parser(cmd, prog=parser.prog + " " + cmd, usage="%(prog)s", help=help_text)
-    # Accept the legacy command without advertising a separate confirmation step.
-    subs.add_parser("confirm", prog=parser.prog + " confirm", usage="%(prog)s")
     repair_parser = subs.add_parser("repair", prog=parser.prog + " repair", usage="%(prog)s [--yes]",
                                     help="исправить обнаруженные проблемы")
     repair_parser.add_argument("--yes", action="store_true",
@@ -1359,6 +1583,7 @@ def main(argv=None):
     if os.geteuid() != 0:
         raise ValueError("Запуск только от root.")
     if args.command == "install":
+        preflight_install()
         confirm_install_start(args.yes)
     if args.command == "repair" and not args.yes:
         if not sys.stdin.isatty():
@@ -1377,8 +1602,7 @@ def main(argv=None):
         # Slow external RDAP queries must never delay the activation rollback lock.
         return execute(args)
     # Root-owned /run lock serializes timer, user changes, activation and rollback.
-    with open("/run/cheburnet-traffic-control.lock", "w", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with exclusive_lock():
         result = execute(args)
     if args.command == "install" and direct_invocation and sys.stdin.isatty():
         menu()
