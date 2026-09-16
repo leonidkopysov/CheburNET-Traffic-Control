@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/cheburnet-scripts-banner.jpg" alt="ЧебурNET — авторские инструменты для Linux-серверов" width="100%"></p>
+<p align="center"><img src="assets/cheburnet-banner.webp" alt="ЧебурNET — авторские инструменты для Linux-серверов" width="100%"></p>
 <h1 align="center">ЧебурNET · Traffic Control</h1>
 <p align="center">Сетевая защита Linux-сервера от сканирования портов и нежелательных подключений</p>
 <p align="center">
